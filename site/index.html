@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Swamp Tunes — Discord Music Bot</title>
+<meta name="description" content="Swamp Tunes plays music from YouTube, Spotify, SoundCloud and Deezer right in your Discord voice channel.">
+<style>
+  :root { --swamp:#2d6a4f; --deep:#08120d; --moss:#40916c; --lime:#b7e4c7; --ink:#d8f3dc; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--deep); color:var(--ink); font-family:'Segoe UI',system-ui,sans-serif; line-height:1.6; }
+  header { text-align:center; padding:64px 20px 40px; background:radial-gradient(ellipse at 50% -20%, #1b4332 0%, var(--deep) 70%); }
+  .logo { font-size:clamp(2.6rem,8vw,4.5rem); font-weight:900; letter-spacing:2px; color:#fff;
+    text-shadow:0 0 24px rgba(64,145,108,.8), 3px 3px 0 #1b4332; }
+  .logo span { color:var(--lime); }
+  .tag { margin-top:12px; font-size:1.15rem; color:var(--lime); }
+  .banner { width:min(440px,85vw); border-radius:18px; border:1px solid #1b4332;
+    box-shadow:0 0 60px rgba(64,145,108,.45); margin-bottom:10px; }
+  .btn { display:inline-block; margin-top:28px; padding:14px 42px; font-size:1.15rem; font-weight:700;
+    color:#08120d; background:linear-gradient(180deg,#b7e4c7,#74c69d); border-radius:999px; text-decoration:none;
+    box-shadow:0 4px 24px rgba(116,198,157,.4); transition:transform .15s; }
+  .btn:hover { transform:scale(1.05); }
+  section { max-width:900px; margin:0 auto; padding:40px 20px; }
+  h2 { color:var(--lime); margin-bottom:16px; font-size:1.6rem; }
+  .sources { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:14px; }
+  .card { background:#0d1f16; border:1px solid #1b4332; border-radius:12px; padding:18px; }
+  .card b { display:block; font-size:1.1rem; margin-bottom:6px; color:#fff; }
+  .card small { color:#95d5b2; }
+  .cmds { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }
+  .cmd { background:#0d1f16; border:1px solid #1b4332; border-radius:10px; padding:12px 14px; font-size:.95rem; }
+  .cmd code { color:var(--lime); font-weight:700; }
+  ol.steps { padding-left:22px; }
+  ol.steps li { margin-bottom:10px; }
+  footer { text-align:center; padding:28px; color:#52796f; font-size:.9rem; border-top:1px solid #1b4332; }
+</style>
+</head>
+<body>
+<header>
+  <img class="banner" src="banner.jpg" alt="The Swamp — Crocodile King artwork">
+  <div class="logo">🎶 SWAMP <span>TUNES</span></div>
+  <p class="tag">The Discord music bot that plays YouTube, Spotify, SoundCloud &amp; Deezer in your voice channel.</p>
+  <a class="btn" id="inviteBtn" href="#">➕ Add to Discord</a>
+</header>
+<section>
+  <h2>Where the music comes from</h2>
+  <div class="sources">
+    <div class="card"><b>▶️ YouTube</b><small>Search any song or paste a link — direct audio.</small></div>
+    <div class="card"><b>🟢 Spotify</b><small>Track, album &amp; playlist links — matched automatically.</small></div>
+    <div class="card"><b>🟠 SoundCloud</b><small>Paste a link, or search with <code>sc:</code>.</small></div>
+    <div class="card"><b>🟣 Deezer</b><small>Track, album &amp; playlist links — no setup needed.</small></div>
+  </div>
+</section>
+<section>
+  <h2>Commands</h2>
+  <div class="cmds">
+    <div class="cmd"><code>/play</code> — play a song or link, or queue a whole playlist</div>
+    <div class="cmd"><code>/stop</code> — stop playback &amp; clear the queue</div>
+    <div class="cmd"><code>/disconnect</code> — leave the voice channel</div>
+    <div class="cmd"><code>/volume</code> — set volume 0–200</div>
+    <div class="cmd"><code>/bassboost</code> — toggle bass boost on/off</div>
+    <div class="cmd"><code>/pause</code> — pause / resume playback</div>
+  </div>
+</section>
+<section>
+  <h2>Get it in your server</h2>
+  <ol class="steps">
+    <li>Hit <b>Add to Discord</b> above and pick your server.</li>
+    <li>Join a voice channel.</li>
+    <li>Type <code>/play never gonna give you up</code> — or paste a Spotify/YouTube/SoundCloud/Deezer link.</li>
+  </ol>
+</section>
+<footer>SWAMP TUNES 🐊 — built for the swamp.</footer>
+</body>
+</html>
