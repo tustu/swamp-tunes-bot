@@ -202,4 +202,3 @@ http.createServer((req, res) => {
 }).listen(PORT, () => console.log(`🌐 Health check listening on port ${PORT}`));
 
 client.login(TOKEN);
-const express = require('express');
