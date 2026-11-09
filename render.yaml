@@ -7,7 +7,9 @@ services:
     envVars:
       - key: DISCORD_TOKEN
         sync: false # set this in the Render dashboard (never commit your token)
+      - key: GUILD_ID
+        value: 337050121717940232 # THE SWAMP — instant slash-command registration
       - key: SPOTIFY_CLIENT_ID
-        sync: false # set in Render dashboard for Spotify link support
+        sync: false # optional; Spotify links also work keyless
       - key: SPOTIFY_CLIENT_SECRET
-        sync: false # set in Render dashboard for Spotify link support
+        sync: false # optional; Spotify links also work keyless
