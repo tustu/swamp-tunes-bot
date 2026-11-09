@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+themes.json
+profile-state.json
