@@ -203,15 +203,3 @@ http.createServer((req, res) => {
 
 client.login(TOKEN);
 const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Render health check route
-app.get('/', (req, res) => {
-  res.send('Swamp Tunes Bot is online and ready to rock!');
-});
-
-app.listen(PORT, () => {
-  console.log(`Health check server listening on port ${PORT}`);
-});
-
