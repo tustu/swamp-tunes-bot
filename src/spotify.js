@@ -1,7 +1,13 @@
 // Spotify link support for Swamp Tunes.
 // Spotify streams are DRM-protected, so we resolve the link to track metadata
-// via the Spotify Web API and play the matching audio from YouTube.
-// Needs SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET (free at developer.spotify.com).
+// and play the matching audio from YouTube.
+//
+// Two ways to read a link, best first:
+// 1. The Spotify Web API — only when SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET
+//    are set (free at developer.spotify.com). If the keys fail, we fall back.
+// 2. Keyless: Spotify's public embed pages (open.spotify.com/embed/…) carry
+//    the same track/album/playlist contents in their page data, no login or
+//    key needed. Production runs this way — no Spotify env vars required.
 
 let tokenCache = null;
 
@@ -9,9 +15,7 @@ async function getToken() {
   const id = process.env.SPOTIFY_CLIENT_ID;
   const secret = process.env.SPOTIFY_CLIENT_SECRET;
   if (!id || !secret) {
-    throw new Error(
-      'Spotify links need SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env — see the README for the 2-minute setup.',
-    );
+    throw new Error('Spotify API keys are not configured.');
   }
   if (tokenCache && tokenCache.expires > Date.now() + 60_000) return tokenCache.token;
   const res = await fetch('https://accounts.spotify.com/api/token', {
@@ -52,12 +56,8 @@ const fmt = (t) => ({
   artist: (t.artists || []).map((a) => a.name).join(', '),
 });
 
-/** Resolve a Spotify URL to a list of { title, artist }. Caps at 50 tracks. */
-export async function resolveSpotify(url) {
-  const parsed = parseSpotifyUrl(url);
-  if (!parsed) throw new Error('Could not read that Spotify link.');
-  const { kind, id } = parsed;
-
+/** Read a Spotify link via the Web API (needs the env keys). Caps at 50 tracks. */
+async function resolveViaApi({ kind, id }) {
   if (kind === 'track' || kind === 'episode') {
     const t = await api(kind === 'track' ? `/tracks/${id}` : `/episodes/${id}`);
     return [fmt(t)];
@@ -88,4 +88,61 @@ export async function resolveSpotify(url) {
     return tracks;
   }
   throw new Error('Spotify artist links are not supported — use a track, album, or playlist link.');
+}
+
+// --- Keyless path: Spotify's public embed pages -----------------------------
+
+const EMBED_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+
+// Embed track lists carry the artist as a joined "subtitle" string, while a
+// single track/album entity carries an artists[] array — accept either.
+const embedFmt = (t) => ({
+  title: t.title || t.name,
+  artist: Array.isArray(t.artists) && t.artists.length
+    ? t.artists.map((a) => a.name).filter(Boolean).join(', ')
+    : t.subtitle || '',
+});
+
+/** Read a Spotify link from its public embed page. No key, no login. Caps at 50 tracks. */
+async function resolveViaEmbed({ kind, id }) {
+  const res = await fetch(`https://open.spotify.com/embed/${kind}/${id}`, {
+    headers: { 'User-Agent': EMBED_UA },
+  });
+  if (res.status === 404) throw new Error('That Spotify link was not found (it may be private or region-locked).');
+  if (!res.ok) throw new Error(`Spotify embed error (${res.status}).`);
+  const html = await res.text();
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  let entity = null;
+  try {
+    entity = m ? JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity : null;
+  } catch { entity = null; }
+  if (!entity) throw new Error('That Spotify link was not found (it may be private or region-locked).');
+
+  if (Array.isArray(entity.trackList) && entity.trackList.length) {
+    const tracks = entity.trackList.map(embedFmt).filter((t) => t.title).slice(0, 50);
+    if (!tracks.length) throw new Error('That Spotify link has no playable tracks (it may be private).');
+    return tracks;
+  }
+  const single = embedFmt(entity);
+  if (single.title) return [single];
+  throw new Error('That Spotify link has no playable tracks (it may be private).');
+}
+
+/** Resolve a Spotify URL to a list of { title, artist }. Caps at 50 tracks. */
+export async function resolveSpotify(url) {
+  const parsed = parseSpotifyUrl(url);
+  if (!parsed) throw new Error('Could not read that Spotify link.');
+  if (parsed.kind === 'artist') {
+    throw new Error('Spotify artist links are not supported — use a track, album, or playlist link.');
+  }
+  const hasKeys = Boolean(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+  if (hasKeys) {
+    try {
+      return await resolveViaApi(parsed);
+    } catch {
+      // Bad or expired keys shouldn't break Spotify links — use the
+      // keyless public pages instead.
+    }
+  }
+  return resolveViaEmbed(parsed);
 }
