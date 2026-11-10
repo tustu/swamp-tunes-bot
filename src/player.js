@@ -10,7 +10,7 @@ import {
   entersState,
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
-import { streamUrlFor, searchOnSoundCloud, searchOnYouTube, formatDuration } from './youtube.js';
+import { streamUrlFor, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, invidiousStreamFor, errReason, formatDuration } from './youtube.js';
 import { applyTheme } from './themes.js';
 
 export const BRAND = 0x2d6a4f; // swamp green
@@ -136,17 +136,20 @@ function clearStreamCache(track) {
 }
 
 /**
- * Background-resolve a track's stream URL and cache it on the queue item,
- * so when its turn comes playback starts with no lookup wait.
- * A failed prefetch clears itself and startTrack falls back to resolving
- * at play time — prefetching can never break playback.
+ * Background-resolve a track's playable URL (the full source cascade in
+ * resolvePlayable, SoundCloud first) and cache it on the queue item, so
+ * when its turn comes playback starts with no lookup wait. Prefetch runs
+ * on a shorter budget and at 'low' priority in the stream lock, so it
+ * never delays a song somebody is actively waiting for. A failed
+ * prefetch clears itself and play time falls back to resolving live —
+ * prefetching can never break playback.
  */
 function prefetchTrack(track) {
   if (!track || track.isLocal || track.streamUrl || track.streamPromise) return;
-  track.streamPromise = streamUrlFor(track.id, track.url)
+  track.streamPromise = resolvePlayable(track, { budgetMs: PREFETCH_BUDGET_MS, priority: 'low' })
     .then((url) => { track.streamUrl = url; return url; })
     .catch((err) => {
-      console.error(`[${BOT_NAME}] prefetch failed for "${track.title}":`, err.message);
+      console.error(`[${BOT_NAME}] prefetch failed for "${track.title}":`, errReason(err));
       track.streamPromise = null;
       return null;
     });
@@ -217,6 +220,23 @@ export function isSameSong(requested, candidate) {
   if (matched < minMatched || titleScore < 0.6) return false;
   const artistWords = [...normTokens(requested.uploader || requested.artist || '')]
     .filter((w) => !ARTIST_STOPWORDS.has(w));
+
+  // The title score above can be fooled when the requested title embeds
+  // the artist's name ("Vybz Kartel - ONSLAUGHT"): a different song by
+  // the same artist matches the artist words and clears 60% without
+  // matching the actual song title at all. So the NON-artist title
+  // words must match on their own — the distinctive part of the title
+  // is what makes it the same song.
+  const distinctiveTokens = [...reqTokens].filter((t) => !artistWords.includes(t));
+  if (distinctiveTokens.length) {
+    let matchedDistinctive = 0;
+    for (const t of distinctiveTokens) if (candTokens.has(t)) matchedDistinctive++;
+    const minDistinctive = distinctiveTokens.length === 1 ? 1 : 2;
+    if (matchedDistinctive < minDistinctive || matchedDistinctive / distinctiveTokens.length < 0.6) {
+      return false;
+    }
+  }
+
   if (!artistWords.length) return true;
   if (artistWords.some((w) => candTokens.has(w))) return true;
   const candUploaderWords = [...normTokens(candidate.uploader || '')]
@@ -225,59 +245,201 @@ export function isSameSong(requested, candidate) {
 }
 
 /**
- * Resolve the URL a track will actually play from, at stream-start time.
- * Order: local file → prefetched URL (instant) → in-flight prefetch →
- * fresh extraction. If YouTube extraction fails outright (its bot wall
- * rejects datacenter IPs no matter which player client asks), the SAME
- * song is hunted down elsewhere, in order:
- * 1. SoundCloud — searched by title + artist, and a candidate only
- *    plays if it passes isSameSong against the requested track.
- * 2. YouTube again via plain search — a different upload of the same
- *    song often extracts when the linked one is walled or gone; same
- *    isSameSong gate, and never the very video that just failed.
- * Only when neither host has the exact song reachable does the track
- * skip, as before. Whichever URL wins is cached on the track, so a
- * replay or bass-boost toggle doesn't pay the lookup again. Tracks
- * that already live on SoundCloud get no fallback (there is nothing
- * behind them). The queue entry, title and now-playing flow never
- * change — only the host behind the song does.
+ * Hard budgets for playback resolution. The old flow could grind for
+ * ~4 minutes per track: five YouTube client extractions at up to 45s
+ * each, serialized behind any prefetch in the stream lock, before the
+ * fallback even started. Now every track gets ONE overall budget —
+ * 40s at play time, 20s for prefetch — each extraction attempt is
+ * capped at ~15s inside streamUrlFor, and when the budget is gone the
+ * track skips with the usual message instead of hanging the queue.
  */
-async function playableUrlFor(track) {
+const RESOLVE_BUDGET_MS = 40_000;
+const PREFETCH_BUDGET_MS = 20_000;
+
+/** Coverage of the requested title's distinctive (non-artist) words, 0..1. */
+function titleScore(requested, candidate) {
+  const reqAll = normTokens(requested.title);
+  if (!reqAll.size) return 0;
+  const artistWords = new Set(
+    [...normTokens(requested.uploader || requested.artist || '')]
+      .filter((w) => !ARTIST_STOPWORDS.has(w)),
+  );
+  const distinctive = new Set([...reqAll].filter((t) => !artistWords.has(t)));
+  const req = distinctive.size ? distinctive : reqAll;
+  const cand = normTokens(`${candidate.title} ${candidate.uploader || ''}`);
+  let matched = 0;
+  for (const t of req) if (cand.has(t)) matched++;
+  return matched / req.size;
+}
+
+/**
+ * Gate-passing candidates, best first: the isSameSong gate decides who
+ * MAY play (unchanged — exact song or nothing); this only decides the
+ * ORDER they are tried in. Score order matters because the first
+ * gate-passing result is not always the song (a same-artist namesake
+ * can pass at 0.67 while the real track sits at 1.0 further down), and
+ * because the top hit is sometimes a DRM-locked official upload whose
+ * extraction fails — the next candidate gets its turn.
+ */
+function rankedMatches(requested, candidates) {
+  return (candidates || [])
+    .filter((c) => isSameSong(requested, c))
+    .map((c) => ({ c, s: titleScore(requested, c) }))
+    .sort((a, b) => b.s - a.s)
+    .map(({ c }) => c);
+}
+
+/**
+ * The playback cascade: find ONE reachable stream for the exact song,
+ * within the budget. Proven in production (Nov 2026): from the host's
+ * datacenter IP, YouTube refuses EVERY player client (webpage 429, API
+ * 403, "failed to extract any player response"), while SoundCloud
+ * serves the same catalog fine — so sources are tried in this order:
+ *
+ * 1. SOUNDCLOUD. A track that lives there plays from its own page.
+ *    Anything else is searched (the SoundCloud API first — fast, and
+ *    its ranking puts the artist's own upload first; the yt-dlp search
+ *    as backup), gated by isSameSong, best match first, up to 3
+ *    candidates tried (official uploads are often SAMPLE-AES DRM and
+ *    fail extraction; fan re-uploads of the same song play).
+ * 2. YOUTUBE, the track's own video through the client rotation.
+ * 3. INVIDIOUS for the same video (another front-end, another network),
+ *    then a gated YouTube RE-SEARCH: a different upload of the same
+ *    song, tried through both extraction routes.
+ *
+ * Every attempt logs exactly one line with its outcome, success or the
+ * failure reason — no silent catches anywhere in this path. The queue
+ * entry, title and now-playing flow never change; only the host behind
+ * the song does.
+ */
+async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority = 'high' } = {}) {
+  const deadline = Date.now() + budgetMs;
+  const remaining = () => deadline - Date.now();
+  const artist = track.uploader || track.artist || '';
+  const isSCTrack = /soundcloud\.com/i.test(track.url || '');
+  let lastErr = null;
+  const noteFail = (label, err) => {
+    lastErr = err;
+    console.log(`[${BOT_NAME}] ${label} failed for "${track.title}": ${errReason(err)}`);
+  };
+
+  const trySoundCloudSearch = async (excludeId) => {
+    let candidates = [];
+    try {
+      candidates = await searchOnSoundCloudApi(track.title, artist, {
+        timeoutMs: Math.min(8_000, Math.max(1_000, remaining())),
+      });
+    } catch (err) { noteFail('soundcloud api search', err); }
+    if (!candidates.length && remaining() > 3_000) {
+      try {
+        candidates = await searchOnSoundCloud(track.title, artist, {
+          timeoutMs: Math.min(15_000, remaining()),
+          retry: false,
+        });
+      } catch (err) { noteFail('soundcloud search', err); }
+    }
+    const ranked = rankedMatches(track, candidates).filter((c) => c.id !== excludeId);
+    if (!ranked.length) {
+      console.log(`[${BOT_NAME}] soundcloud: no exact-song match for "${track.title}"`);
+      return null;
+    }
+    for (const cand of ranked.slice(0, 5)) {
+      if (remaining() <= 1_000) break;
+      try {
+        const url = await streamUrlFor(cand.id, cand.url, { priority, deadline });
+        console.log(`[${BOT_NAME}] soundcloud: playing "${cand.title}" by ${cand.uploader || 'unknown'} for "${track.title}"`);
+        return url;
+      } catch (err) { noteFail(`soundcloud candidate "${cand.title}"`, err); }
+    }
+    return null;
+  };
+
+  // Tier 1 — SoundCloud.
+  if (isSCTrack) {
+    try {
+      const url = await streamUrlFor(track.id, track.url, { priority, deadline });
+      console.log(`[${BOT_NAME}] soundcloud: playing "${track.title}" from its own page`);
+      return url;
+    } catch (err) { noteFail('soundcloud', err); }
+    const viaSearch = await trySoundCloudSearch(track.id);
+    if (viaSearch) return viaSearch;
+  } else {
+    const viaSC = await trySoundCloudSearch(null);
+    if (viaSC) return viaSC;
+  }
+
+  // Tier 2 — YouTube rotation on the track's own video.
+  if (!isSCTrack && track.id && remaining() > 1_000) {
+    try {
+      return await streamUrlFor(track.id, track.url, { priority, deadline });
+    } catch (err) { noteFail('youtube', err); }
+  }
+
+  // Tier 3a — Invidious: the same video through another front-end.
+  if (!isSCTrack && track.id && remaining() > 1_000) {
+    try {
+      const s = await invidiousStreamFor(track.id, { deadline });
+      console.log(`[${BOT_NAME}] invidious: playing "${track.title}" via ${s.host} (${s.format})`);
+      return s.url;
+    } catch (err) { noteFail('invidious', err); }
+  }
+
+  // Tier 3b — gated re-search: another upload of the same song, through
+  // yt-dlp extraction and then Invidious. Also the only YouTube route
+  // for a SoundCloud-native track whose own page failed.
+  if (remaining() > 3_000) {
+    let candidates = [];
+    try {
+      candidates = await searchOnYouTube(track.title, artist, {
+        timeoutMs: Math.min(15_000, remaining()),
+        retry: false,
+      });
+    } catch (err) { noteFail('youtube re-search', err); }
+    const ranked = rankedMatches(track, candidates).filter((c) => c.id !== track.id);
+    if (!ranked.length) {
+      console.log(`[${BOT_NAME}] youtube re-search: no other upload of "${track.title}"`);
+    }
+    for (const cand of ranked.slice(0, 2)) {
+      if (remaining() <= 1_000) break;
+      try {
+        const url = await streamUrlFor(cand.id, cand.url, { priority, deadline });
+        console.log(`[${BOT_NAME}] youtube re-search: playing another upload of "${track.title}" ("${cand.title}")`);
+        return url;
+      } catch (err) { noteFail(`youtube candidate "${cand.title}"`, err); }
+      if (remaining() <= 1_000) break;
+      try {
+        const s = await invidiousStreamFor(cand.id, { deadline });
+        console.log(`[${BOT_NAME}] invidious: playing "${cand.title}" via ${s.host} (${s.format}) for "${track.title}"`);
+        return s.url;
+      } catch (err) { noteFail(`invidious candidate "${cand.title}"`, err); }
+    }
+  }
+
+  throw lastErr || new Error(`No reachable source for "${track.title}"`);
+}
+
+/**
+ * Resolve the URL a track will actually play from, at stream-start time:
+ * local file → prefetched URL (instant) → in-flight prefetch (given a
+ * short head start only — play time never queues behind background
+ * warming) → the live cascade in resolvePlayable. Whichever URL wins is
+ * cached on the track, so a replay or bass-boost toggle doesn't pay the
+ * lookup again.
+ */
+export async function playableUrlFor(track) {
   if (track.isLocal) return track.localFile;
   if (track.streamUrl) return track.streamUrl; // prefetched — start instantly
   if (track.streamPromise) {
-    const warmed = await track.streamPromise; // prefetch in flight
+    const warmed = await Promise.race([
+      track.streamPromise,
+      new Promise((r) => setTimeout(() => r(null), 4_000)),
+    ]);
     if (warmed) return warmed;
+    if (track.streamUrl) return track.streamUrl;
   }
-  try {
-    return await streamUrlFor(track.id, track.url);
-  } catch (err) {
-    if (/soundcloud\.com/i.test(track.url || '')) throw err;
-    const artist = track.uploader || track.artist || '';
-    // 1) The same song on SoundCloud.
-    try {
-      const candidates = await searchOnSoundCloud(track.title, artist);
-      const match = candidates.find((c) => isSameSong(track, c));
-      if (match) {
-        const url = await streamUrlFor(match.id, match.url);
-        track.streamUrl = url;
-        console.log(`[${BOT_NAME}] YouTube blocked, fell back to SoundCloud for "${track.title}"`);
-        return url;
-      }
-    } catch { /* no reachable SoundCloud copy — try the re-search below */ }
-    // 2) The same song through a fresh YouTube search (different upload).
-    try {
-      const candidates = await searchOnYouTube(track.title, artist);
-      const match = candidates.find((c) => c.id !== track.id && isSameSong(track, c));
-      if (match) {
-        const url = await streamUrlFor(match.id, match.url);
-        track.streamUrl = url;
-        console.log(`[${BOT_NAME}] YouTube blocked "${track.title}", playing another upload of the same song found via search`);
-        return url;
-      }
-    } catch { /* nothing reachable — the skip below is honest */ }
-    throw err;
-  }
+  const url = await resolvePlayable(track, { budgetMs: RESOLVE_BUDGET_MS, priority: 'high' });
+  track.streamUrl = url;
+  return url;
 }
 
 function startTrack(state, guildId, track) {
