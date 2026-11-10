@@ -10,8 +10,25 @@ import {
   entersState,
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
+import playDl from 'play-dl';
+import ffmpegStatic from 'ffmpeg-static';
 import { streamUrlFor, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, invidiousStreamFor, errReason, formatDuration } from './youtube.js';
 import { applyTheme } from './themes.js';
+
+// ffmpeg choice: the host's own ffmpeg FIRST (the Dockerfile installs
+// it, and it is the build that has played every verified stream —
+// the johnvansickle static build sat silent on SoundCloud HLS in
+// testing, producing no audio at all). ffmpeg-static is only the
+// fallback for a host with no ffmpeg of its own.
+import { execFileSync } from 'node:child_process';
+const FFMPEG = (() => {
+  try {
+    execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' });
+    return 'ffmpeg';
+  } catch {
+    return ffmpegStatic || 'ffmpeg';
+  }
+})();
 
 export const BRAND = 0x2d6a4f; // swamp green
 export const BOT_NAME = 'Swamp Tunes';
@@ -147,7 +164,19 @@ function clearStreamCache(track) {
 function prefetchTrack(track) {
   if (!track || track.isLocal || track.streamUrl || track.streamPromise) return;
   track.streamPromise = resolvePlayable(track, { budgetMs: PREFETCH_BUDGET_MS, priority: 'low' })
-    .then((url) => { track.streamUrl = url; return url; })
+    .then((src) => {
+      if (src && typeof src === 'object') {
+        // A play-dl stream can't be cached — it starts flowing now.
+        // Shut it down and just remember play-dl reaches this track,
+        // so play time goes straight back to it.
+        try { src.playDl.stream.destroy(); } catch { /* already closed */ }
+        track.playDlVerified = true;
+        track.streamPromise = null;
+        return null;
+      }
+      track.streamUrl = src;
+      return src;
+    })
     .catch((err) => {
       console.error(`[${BOT_NAME}] prefetch failed for "${track.title}":`, errReason(err));
       track.streamPromise = null;
@@ -170,7 +199,7 @@ export function createResource(url, bassBoost, state) {
   // of its probe/transcode path — and with no opus encoder installed
   // that path died on every non-Opus stream (the Nov 9 production bug:
   // songs resolved, then "Cannot find module '@discordjs/opus'").
-  const ff = spawn('ffmpeg', [
+  const ff = spawn(FFMPEG, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-analyzeduration', '0', '-loglevel', '0',
     '-i', url,
@@ -182,6 +211,40 @@ export function createResource(url, bassBoost, state) {
   state.ffmpeg = ff;
   ff.on('error', () => {});
   return createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+}
+
+/**
+ * Play a play-dl stream: the stream play-dl opened is piped into the
+ * same ffmpeg stage every other source uses, so volume, bass boost and
+ * the opus pipeline behave identically whatever door the song came in.
+ */
+export function createPlayDlResource(playDlInfo, bassBoost, state) {
+  const ff = spawn(FFMPEG, [
+    '-analyzeduration', '0', '-loglevel', '0',
+    '-i', 'pipe:0',
+    '-vn',
+    ...(bassBoost ? ['-af', 'bass=g=15:f=110'] : []),
+    '-f', 's16le', '-ar', '48000', '-ac', '2',
+    'pipe:1',
+  ], { stdio: ['pipe', 'pipe', 'ignore'] });
+  state.ffmpeg = ff;
+  ff.on('error', () => {});
+  ff.stdin.on('error', () => {});
+  const input = playDlInfo.stream;
+  input.on('error', () => { try { ff.stdin.destroy(); } catch { /* already gone */ } });
+  input.pipe(ff.stdin);
+  return createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+}
+
+/** Race a promise against a timeout; on timeout the loser is destroyed if it ever lands. */
+function withStreamTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
 /**
@@ -372,6 +435,22 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     return null;
   };
 
+  // Tier 0 — play-dl, for YouTube tracks: opens the stream directly
+  // instead of asking yt-dlp to extract one, so YouTube's bot wall
+  // never gets a say. Returns a live stream object, not a URL;
+  // callers route it through the same ffmpeg stage as every source.
+  if (!isSCTrack && track.url && remaining() > 1_000) {
+    try {
+      const info = await withStreamTimeout(
+        playDl.stream(track.url),
+        Math.min(6_000, remaining()),
+        'play-dl',
+      );
+      console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
+      return { playDl: info };
+    } catch (err) { noteFail('play-dl', err); }
+  }
+
   // Tier 1 — SoundCloud.
   if (isSCTrack) {
     try {
@@ -386,20 +465,26 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     if (viaSC) return viaSC;
   }
 
-  // Tier 2 — YouTube rotation on the track's own video.
-  if (!isSCTrack && track.id && remaining() > 1_000) {
-    try {
-      return await streamUrlFor(track.id, track.url, { priority, deadline });
-    } catch (err) { noteFail('youtube', err); }
-  }
-
-  // Tier 3a — Invidious: the same video through another front-end.
+  // Tier 2 — Invidious: the same video through another front-end.
+  // This door answers from the instance's network, so it goes BEFORE
+  // the yt-dlp rotation: from a datacenter IP every walled rotation
+  // attempt burns its full timeout, and putting rotation first starved
+  // Invidious out of the budget entirely (Bizzy Banks, Nov 9 — the
+  // song died with its one reachable door never tried).
   if (!isSCTrack && track.id && remaining() > 1_000) {
     try {
       const s = await invidiousStreamFor(track.id, { deadline });
       console.log(`[${BOT_NAME}] invidious: playing "${track.title}" via ${s.host} (${s.format})`);
       return s.url;
     } catch (err) { noteFail('invidious', err); }
+  }
+
+  // Tier 3 — YouTube rotation on the track's own video (last resort:
+  // slow and walled from datacenter IPs).
+  if (!isSCTrack && track.id && remaining() > 1_000) {
+    try {
+      return await streamUrlFor(track.id, track.url, { priority, deadline });
+    } catch (err) { noteFail('youtube', err); }
   }
 
   // Tier 3b — gated re-search: another upload of the same song, through
@@ -455,17 +540,26 @@ export async function playableUrlFor(track) {
     if (warmed) return warmed;
     if (track.streamUrl) return track.streamUrl;
   }
-  const url = await resolvePlayable(track, { budgetMs: RESOLVE_BUDGET_MS, priority: 'high' });
-  track.streamUrl = url;
-  return url;
+  const src = await resolvePlayable(track, { budgetMs: RESOLVE_BUDGET_MS, priority: 'high' });
+  if (typeof src === 'string') track.streamUrl = src; // play-dl streams can't be cached
+  return src;
 }
 
 function startTrack(state, guildId, track) {
   killFfmpeg(state);
   return (async () => {
-    const url = await playableUrlFor(track);
-    if (!url) throw new Error('No playable source for this track.');
-    const resource = createResource(url, state.bassBoost, state);
+    const src = await playableUrlFor(track);
+    if (!src) throw new Error('No playable source for this track.');
+    // Join only once the song is actually in hand — search and stream
+    // first, then join, then play. Joining first left the bot sitting
+    // silent in voice while the lookup ground on, and Discord dropped
+    // the idle connection (close 4014, Nov 9).
+    if (state.guild && state.pendingMember) {
+      ensureConnection(state, state.guild, state.pendingMember);
+    }
+    const resource = typeof src === 'object'
+      ? createPlayDlResource(src.playDl, state.bassBoost, state)
+      : createResource(src, state.bassBoost, state);
     resource.volume?.setVolume(state.volume);
     state.player.play(resource);
     announce(state, { embeds: [nowPlayingEmbed(track, state, guildId)] });
@@ -541,12 +635,29 @@ function ensureConnection(state, guild, member) {
   }
 }
 
-/** Join (or move to) the user's voice channel. Fails fast if they're not in one. */
+/** Fail fast unless the user is in a voice channel the bot may speak in. */
+function validateVoice(guild, member) {
+  const voiceChannel = member?.voice?.channel;
+  if (!voiceChannel) throw new Error('Join a voice channel first, then run the command again.');
+  const perms = voiceChannel.permissionsFor(guild.members.me);
+  if (!perms?.has('Connect') || !perms?.has('Speak')) {
+    throw new Error(`I need **Connect** and **Speak** permissions in ${voiceChannel}.`);
+  }
+}
+
+/**
+ * Record where playback will happen and validate the user's channel —
+ * but do NOT join yet. The join happens in startTrack, after the song
+ * has resolved, so the bot never sits silent in voice waiting on a
+ * lookup.
+ */
 export function prepareVoice(guild, member, textChannel) {
   const state = getState(guild.id);
   state.textChannel = textChannel;
+  state.guild = guild;
+  state.pendingMember = member;
   try { state.guildIcon = guild.iconURL() || null; } catch { state.guildIcon = null; }
-  ensureConnection(state, guild, member);
+  validateVoice(guild, member);
   return state;
 }
 
