@@ -8,7 +8,12 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm install --omit=dev
+# npm ci installs exactly what the committed lockfile pins. The old
+# lockfile described an ancient minimal bot, so `npm install` silently
+# re-resolved every dependency at image build time — what ran in
+# production was whatever npm picked that day. The lockfile is now
+# regenerated from package.json; keep the two in sync.
+RUN npm ci --omit=dev
 COPY src ./src
 COPY assets ./assets
 
