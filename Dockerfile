@@ -1,4 +1,4 @@
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 # yt-dlp + ffmpeg (needed for YouTube audio)
 RUN apt-get update \
