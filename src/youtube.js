@@ -179,6 +179,86 @@ export async function resolveTextQuery(query) {
  * Find the best YouTube match for a { title, artist } pair.
  * Used to play Spotify / Deezer links, whose audio comes from YouTube.
  */
+/** Extract a YouTube video id from any YouTube URL form, or null. */
+export function youtubeVideoId(url) {
+  const m = String(url).match(
+    /(?:youtube\.com\/(?:watch\?[^#]*v=|shorts\/|embed\/|live\/|v\/)|youtu\.be\/)([\w-]{11})/,
+  );
+  return m ? m[1] : null;
+}
+
+/** One video's metadata via a public Invidious instance. Null on failure. */
+export async function getVideoOnInvidious(videoId, opts = {}) {
+  const hosts = await invidiousHosts();
+  const timeoutMs = opts.timeoutMs || 6_000;
+  for (const host of hosts.slice(0, 2)) {
+    try {
+      const res = await fetch(
+        `https://${host}/api/v1/videos/${encodeURIComponent(videoId)}?fields=videoId,title,author,lengthSeconds,videoThumbnails`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) continue;
+      const v = await res.json();
+      if (!v?.videoId || !v?.title) continue;
+      const thumbs = Array.isArray(v.videoThumbnails) ? v.videoThumbnails : [];
+      const thumb = thumbs.find((t) => t.quality === 'maxres') || thumbs[0];
+      const track = {
+        id: v.videoId,
+        title: String(v.title).replace(/\s+/g, ' ').trim(),
+        duration: Number(v.lengthSeconds) || 0,
+        url: `https://www.youtube.com/watch?v=${v.videoId}`,
+      };
+      if (v.author) track.uploader = String(v.author).replace(/\s+/g, ' ').trim();
+      if (thumb?.url) track.thumbnail = thumb.url.startsWith('http') ? thumb.url : `https://${host}${thumb.url}`;
+      return track;
+    } catch { /* try the next instance */ }
+  }
+  return null;
+}
+
+/**
+ * Resolve a pasted YouTube link WITHOUT yt-dlp first: from a datacenter
+ * IP, yt-dlp's own extraction is walled (429/403, "failed to extract any
+ * player response") and grinds through client retries for the better
+ * part of a minute before throwing — that was a pasted link dying at
+ * the /play front door even after the playback chain behind it worked.
+ * The video's identity comes from an Invidious instance instead (fast,
+ * unwalled); the playback cascade in the player does the rest. oEmbed
+ * is the second door; yt-dlp stays only as the last resort.
+ */
+export async function resolveYouTubeUrl(url) {
+  const id = youtubeVideoId(url);
+  if (!id) return resolveTrack(url);
+  const viaInv = await getVideoOnInvidious(id).catch(() => null);
+  if (viaInv) return viaInv;
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}&format=json`,
+      { signal: AbortSignal.timeout(5_000) },
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.title) {
+        return await resolveTextQuery(`${data.title} ${data.author_name || ''}`.trim());
+      }
+    }
+  } catch { /* fall through to the yt-dlp last resort */ }
+  return resolveTrack(url);
+}
+
+/**
+ * The one resolver /play and /forceplay use for a raw query: YouTube
+ * links go through the unwalled side doors, other links keep the
+ * direct yt-dlp route, and plain text goes SoundCloud-first.
+ */
+export async function resolveAnyQuery(query) {
+  const q = String(query).trim();
+  if (/^https?:\/\//i.test(q)) {
+    return youtubeVideoId(q) ? resolveYouTubeUrl(q) : resolveTrack(q);
+  }
+  return resolveTextQuery(q);
+}
+
 export async function findOnYouTube(title, artist) {
   const q = `${title} ${artist || ''}`.trim();
   const { stdout } = await ytMeta([
