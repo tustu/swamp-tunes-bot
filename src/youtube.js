@@ -145,6 +145,31 @@ export async function resolveTrack(query) {
 }
 
 /**
+ * Resolve a plain-text /play query (a song name, not a link) to ONE track.
+ * SoundCloud's own API goes first: it answers in about a second and its
+ * tracks stream natively, while a yt-dlp YouTube search from a datacenter
+ * IP dies on the bot wall (429/403, "failed to extract any player
+ * response") before the playback cascade ever gets a track — that was
+ * the /play front door failing while the player behind it was fine.
+ * Backups, in order: the yt-dlp SoundCloud search, then ONE no-retry
+ * YouTube search with a short cap. Throws a plain "no results" error.
+ */
+export async function resolveTextQuery(query) {
+  const q = query.trim();
+  const sc = q.match(/^(?:sc:|soundcloud:)\s*(.+)/i);
+  const text = sc ? sc[1] : q;
+  if (!sc) {
+    const viaApi = await searchOnSoundCloudApi(text, '', { timeoutMs: 6_000 }).catch(() => []);
+    if (viaApi.length) return viaApi[0];
+  }
+  const viaScSearch = await searchOnSoundCloud(text, '', { timeoutMs: 10_000, retry: false }).catch(() => []);
+  if (viaScSearch.length) return viaScSearch[0];
+  const viaYt = await searchOnYouTube(text, '', { timeoutMs: 10_000, retry: false }).catch(() => []);
+  if (viaYt.length) return viaYt[0];
+  throw new Error(`No results found for "${text}".`);
+}
+
+/**
  * Find the best YouTube match for a { title, artist } pair.
  * Used to play Spotify / Deezer links, whose audio comes from YouTube.
  */
