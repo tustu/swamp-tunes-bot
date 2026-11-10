@@ -9,7 +9,7 @@ import {
   PermissionFlagsBits,
 } from 'discord.js';
 import { commands } from './commands.js';
-import { checkYtDlp, resolveTrack, resolvePlaylistTracks, parsePlaylistLink, findOnYouTube, formatDuration } from './youtube.js';
+import { checkYtDlp, resolveTrack, resolveTextQuery, resolvePlaylistTracks, parsePlaylistLink, findOnYouTube, formatDuration } from './youtube.js';
 import { isSpotifyUrl, resolveSpotify } from './spotify.js';
 import { isDeezerUrl, resolveDeezer } from './deezer.js';
 import { isAppleMusicUrl, resolveAppleMusic } from './applemusic.js';
@@ -64,6 +64,22 @@ function okEmbed(text) {
   return new EmbedBuilder().setColor(BRAND).setDescription(text).setFooter({ text: BOT_NAME });
 }
 
+/**
+ * What a command error may say in the channel. The bot's own errors are
+ * written for members ("Join a voice channel first…") and pass through;
+ * anything carrying tool output (a raw yt-dlp failure dumps the whole
+ * command and its stderr) becomes one clean line — the full error still
+ * goes to the server log, never into the chat.
+ */
+function publicErrorMessage(err) {
+  const msg = String(err?.message || '');
+  const technical = /command failed|yt-dlp|http error|error: \[|warning: \[|failed to extract|killed with|etimedout|econnreset/i;
+  if (!msg || msg.length > 180 || technical.test(msg)) {
+    return 'Something went wrong with that one — try again, or try a direct link.';
+  }
+  return msg;
+}
+
 function guildIcon(guild) {
   try { return guild?.iconURL() || null; } catch { return null; }
 }
@@ -85,7 +101,11 @@ async function resolveLinkedTrack(query) {
   const isSp = isSpotifyUrl(query);
   const isDz = isDeezerUrl(query);
   const isAm = isAppleMusicUrl(query);
-  if (!isSp && !isDz && !isAm) return resolveTrack(query);
+  if (!isSp && !isDz && !isAm) {
+    // Plain song names resolve through SoundCloud first (fast, streams
+    // natively); direct links keep the yt-dlp route.
+    return /^https?:\/\//i.test(query.trim()) ? resolveTrack(query) : resolveTextQuery(query);
+  }
   const sourceName = isSp ? 'Spotify' : isDz ? 'Deezer' : 'Apple Music';
   const metas = isSp
     ? await resolveSpotify(query)
@@ -164,7 +184,9 @@ function attachInteractionHandler(client) {
           return;
         }
 
-        const track = await resolveTrack(query);
+        const track = /^https?:\/\//i.test(query.trim())
+          ? await resolveTrack(query)
+          : await resolveTextQuery(query);
         const { position } = enqueue(interaction.guild, interaction.member, interaction.channel, track);
         const embed = new EmbedBuilder()
           .setTitle('➕ Added to queue')
@@ -376,8 +398,8 @@ function attachInteractionHandler(client) {
           await interaction.reply({ embeds: [errEmbed('Unknown command.')] });
       }
     } catch (err) {
-      console.error(`[${BOT_NAME}] command error:`, err.message);
-      const payload = { embeds: [errEmbed(err.message || 'Something went wrong.')] };
+      console.error(`[${BOT_NAME}] command error:`, err?.stack || err?.message || err);
+      const payload = { embeds: [errEmbed(publicErrorMessage(err))] };
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply(payload).catch(() => interaction.followUp({ ...payload, ephemeral: true }));
       } else {
