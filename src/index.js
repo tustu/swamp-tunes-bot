@@ -7,6 +7,7 @@ import {
   Routes,
   EmbedBuilder,
   PermissionFlagsBits,
+  MessageFlags,
 } from 'discord.js';
 import { commands } from './commands.js';
 import { checkYtDlp, resolveTrack, resolveTextQuery, resolveAnyQuery, resolvePlaylistTracks, parsePlaylistLink, findOnYouTube, formatDuration } from './youtube.js';
@@ -360,7 +361,7 @@ function attachInteractionHandler(client) {
         }
         case 'theme': {
           if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
-            await interaction.reply({ embeds: [errEmbed('You need the **Manage Server** permission to set the theme.')], ephemeral: true });
+            await interaction.reply({ embeds: [errEmbed('You need the **Manage Server** permission to set the theme.')], flags: MessageFlags.Ephemeral });
             break;
           }
           const colorInput = interaction.options.getString('color');
@@ -368,7 +369,7 @@ function attachInteractionHandler(client) {
           if (!colorInput && !style) {
             await interaction.reply({
               embeds: [errEmbed('Give me a color (like #2bff88) and/or a thumbnail style to set.')],
-              ephemeral: true,
+              flags: MessageFlags.Ephemeral,
             });
             break;
           }
@@ -400,9 +401,9 @@ function attachInteractionHandler(client) {
       const payload = { embeds: [errEmbed(publicErrorMessage(err))] };
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply(payload)
-          .catch(() => interaction.followUp({ ...payload, ephemeral: true }).catch(() => {}));
+          .catch(() => interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral }).catch(() => {}));
       } else {
-        await interaction.reply({ ...payload, ephemeral: true }).catch(() => {});
+        await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   });
@@ -474,7 +475,7 @@ function buildClient(withMessageIntents) {
   // (that turned one failed /play into a full crash + restart).
   client.on('error', (err) => console.error(`[${BOT_NAME}] client error:`, err?.message || err));
 
-  client.once('ready', async () => {
+  client.once('clientReady', async () => {
     console.log(`✅ ${BOT_NAME} is online as ${client.user.tag}`);
 
     const ytdlp = await checkYtDlp();
