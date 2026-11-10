@@ -462,22 +462,6 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     return null;
   };
 
-  // Tier 0 — play-dl, for YouTube tracks: opens the stream directly
-  // instead of asking yt-dlp to extract one, so YouTube's bot wall
-  // never gets a say. Returns a live stream object, not a URL;
-  // callers route it through the same ffmpeg stage as every source.
-  if (!isSCTrack && track.url && remaining() > 1_000) {
-    try {
-      const info = await withStreamTimeout(
-        playDl.stream(track.url),
-        Math.min(6_000, remaining()),
-        'play-dl',
-      );
-      console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
-      return { playDl: info };
-    } catch (err) { noteFail('play-dl', err); }
-  }
-
   // Tier 1 — SoundCloud.
   if (isSCTrack) {
     try {
@@ -491,6 +475,25 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     const viaSC = await trySoundCloudSearch(null);
     if (viaSC) return viaSC;
   }
+
+  // Tier 1.5 — play-dl, for YouTube tracks SoundCloud could not place: opens the stream directly
+  // instead of asking yt-dlp to extract one, so YouTube's bot wall
+  // never gets a say. Tried after SoundCloud because from every
+  // network tested on Nov 9 it answered 429 and only added its
+  // timeout to songs SoundCloud places instantly. Returns a live stream object, not a URL;
+  // callers route it through the same ffmpeg stage as every source.
+  if (!isSCTrack && track.url && remaining() > 1_000) {
+    try {
+      const info = await withStreamTimeout(
+        playDl.stream(track.url),
+        Math.min(6_000, remaining()),
+        'play-dl',
+      );
+      console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
+      return { playDl: info };
+    } catch (err) { noteFail('play-dl', err); }
+  }
+
 
   // Tier 2 — Invidious: the same video through another front-end.
   // This door answers from the instance's network, so it goes BEFORE
