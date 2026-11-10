@@ -9,7 +9,7 @@ import {
   PermissionFlagsBits,
 } from 'discord.js';
 import { commands } from './commands.js';
-import { checkYtDlp, resolveTrack, resolveTextQuery, resolvePlaylistTracks, parsePlaylistLink, findOnYouTube, formatDuration } from './youtube.js';
+import { checkYtDlp, resolveTrack, resolveTextQuery, resolveAnyQuery, resolvePlaylistTracks, parsePlaylistLink, findOnYouTube, formatDuration } from './youtube.js';
 import { isSpotifyUrl, resolveSpotify } from './spotify.js';
 import { isDeezerUrl, resolveDeezer } from './deezer.js';
 import { isAppleMusicUrl, resolveAppleMusic } from './applemusic.js';
@@ -102,9 +102,9 @@ async function resolveLinkedTrack(query) {
   const isDz = isDeezerUrl(query);
   const isAm = isAppleMusicUrl(query);
   if (!isSp && !isDz && !isAm) {
-    // Plain song names resolve through SoundCloud first (fast, streams
-    // natively); direct links keep the yt-dlp route.
-    return /^https?:\/\//i.test(query.trim()) ? resolveTrack(query) : resolveTextQuery(query);
+    // Plain song names AND YouTube links resolve through the unwalled
+    // doors (SoundCloud/Invidious); other direct links keep yt-dlp.
+    return resolveAnyQuery(query);
   }
   const sourceName = isSp ? 'Spotify' : isDz ? 'Deezer' : 'Apple Music';
   const metas = isSp
@@ -184,9 +184,7 @@ function attachInteractionHandler(client) {
           return;
         }
 
-        const track = /^https?:\/\//i.test(query.trim())
-          ? await resolveTrack(query)
-          : await resolveTextQuery(query);
+        const track = await resolveAnyQuery(query);
         const { position } = enqueue(interaction.guild, interaction.member, interaction.channel, track);
         const embed = new EmbedBuilder()
           .setTitle('➕ Added to queue')
@@ -401,9 +399,10 @@ function attachInteractionHandler(client) {
       console.error(`[${BOT_NAME}] command error:`, err?.stack || err?.message || err);
       const payload = { embeds: [errEmbed(publicErrorMessage(err))] };
       if (interaction.deferred || interaction.replied) {
-        await interaction.editReply(payload).catch(() => interaction.followUp({ ...payload, ephemeral: true }));
+        await interaction.editReply(payload)
+          .catch(() => interaction.followUp({ ...payload, ephemeral: true }).catch(() => {}));
       } else {
-        await interaction.reply({ ...payload, ephemeral: true });
+        await interaction.reply({ ...payload, ephemeral: true }).catch(() => {});
       }
     }
   });
@@ -470,6 +469,10 @@ function buildClient(withMessageIntents) {
   const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
   if (withMessageIntents) intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
   const client = new Client({ intents });
+  // A failed interaction reply must never take the process down: an
+  // unhandled 'error' event on the Client throws and kills the bot
+  // (that turned one failed /play into a full crash + restart).
+  client.on('error', (err) => console.error(`[${BOT_NAME}] client error:`, err?.message || err));
 
   client.once('ready', async () => {
     console.log(`✅ ${BOT_NAME} is online as ${client.user.tag}`);
