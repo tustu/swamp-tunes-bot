@@ -559,15 +559,37 @@ export async function searchOnInvidious(query, opts = {}) {
 }
 
 /**
+ * Does media actually flow from this URL, right now, from this host?
+ * Reads the first chunk and stops — enough to prove the pipe is wet.
+ * A door that answers metadata but delivers no bytes (the Nov 9
+ * chocolatemoo53 failure: resolved fine, then 0 bytes in 5s, in the
+ * sandbox AND on the host) fails here instead of failing silently
+ * in the voice channel.
+ */
+async function urlFlows(url, timeoutMs) {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok || !res.body) return false;
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    try { await reader.cancel(); } catch { /* done */ }
+    return !first.done && !!first.value && first.value.byteLength > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Best audio stream for a YouTube video id, via a public Invidious
- * instance. Returns { url, host, format }. Throws if no tried instance
- * can serve the video.
+ * instance. Returns { url, host, format } — and the URL is only
+ * returned after its first bytes have actually flowed. Throws if no
+ * tried instance can serve the video.
  */
 export async function invidiousStreamFor(videoId, opts = {}) {
   const deadline = opts.deadline || null;
   const hosts = await invidiousHosts();
   let lastErr = null;
-  for (const host of hosts.slice(0, 2)) {
+  for (const host of hosts.slice(0, 3)) {
     const budget = deadline ? deadline - Date.now() : (opts.timeoutMs || 10_000);
     if (budget <= 500) { lastErr = lastErr || new Error('Invidious lookup ran out of time'); break; }
     try {
@@ -582,6 +604,11 @@ export async function invidiousStreamFor(videoId, opts = {}) {
           || ((b.bitrate || 0) - (a.bitrate || 0)));
       if (!audio.length) throw new Error('no audio formats');
       const best = audio[0];
+      const flowBudget = deadline ? deadline - Date.now() : 5_000;
+      if (flowBudget <= 500) throw new Error('Invidious flow check ran out of time');
+      if (!(await urlFlows(best.url, Math.min(5_000, flowBudget)))) {
+        throw new Error(`stream via ${host} delivered no data`);
+      }
       return {
         url: best.url,
         host,
