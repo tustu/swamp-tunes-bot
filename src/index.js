@@ -36,6 +36,7 @@ import {
   forceSkip,
   forcePlay,
   trackLabel,
+  hostDiagnostics,
 } from './player.js';
 import { setTheme, parseHexColor, formatHexColor, applyTheme } from './themes.js';
 import { applyProfile } from './profile.js';
@@ -484,6 +485,11 @@ function buildClient(withMessageIntents) {
     } else {
       console.log(`🎬 yt-dlp ${ytdlp} ready`);
     }
+
+    // Voice media is UDP; say at boot whether this host can do UDP at
+    // all, so a "joins but plays silence" host is named in the log
+    // instead of discovered by ear in a voice channel.
+    void hostDiagnostics();
 
     // Register slash commands
     const rest = new REST({ version: '10' }).setToken(TOKEN);
