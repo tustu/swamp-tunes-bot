@@ -12,7 +12,7 @@ import {
 import { EmbedBuilder } from 'discord.js';
 import playDl from 'play-dl';
 import ffmpegStatic from 'ffmpeg-static';
-import { streamUrlFor, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, invidiousStreamFor, errReason, formatDuration } from './youtube.js';
+import { streamUrlFor, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, invidiousStreamFor, resolveTextQuery, errReason, formatDuration } from './youtube.js';
 import { applyTheme } from './themes.js';
 
 // ffmpeg choice: the host's own ffmpeg FIRST (the Dockerfile installs
@@ -543,6 +543,76 @@ export async function playableUrlFor(track) {
   const src = await resolvePlayable(track, { budgetMs: RESOLVE_BUDGET_MS, priority: 'high' });
   if (typeof src === 'string') track.streamUrl = src; // play-dl streams can't be cached
   return src;
+}
+
+// ---------------------------------------------------------------------------
+// HOST SELF-PROBE (diagnostic, added Nov 9 late): triggered over HTTP by
+// an operator holding PROBE_KEY — never by Discord users. It answers,
+// FROM THE HOST ITSELF, the two questions the Nov 9 outage turned on:
+// (1) can this host complete a UDP round trip at all (Discord voice
+// media is UDP; the signalling that reports "ready" is not), and
+// (2) does real audio data actually flow through the full pipeline
+// (resolve a track, run it through ffmpeg, count the bytes) — per song.
+// ---------------------------------------------------------------------------
+import dgram from 'node:dgram';
+
+function probeUdp() {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket('udp4');
+    const txid = Buffer.alloc(12, 7);
+    const req = Buffer.concat([
+      Buffer.from([0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42]),
+      txid,
+    ]);
+    const done = (v) => { try { sock.close(); } catch { /* closed */ } resolve(v); };
+    const timer = setTimeout(() => done(false), 3_500);
+    sock.once('message', () => { clearTimeout(timer); done(true); });
+    sock.once('error', () => { clearTimeout(timer); done(false); });
+    sock.send(req, 19302, 'stun.l.google.com', (err) => { if (err) { clearTimeout(timer); done(false); } });
+  });
+}
+
+function countBytes(stream, ms) {
+  return new Promise((resolve) => {
+    let bytes = 0;
+    const onData = (d) => { bytes += d.length; };
+    stream.on('data', onData);
+    setTimeout(() => { stream.off('data', onData); resolve(bytes); }, ms);
+  });
+}
+
+export async function probePlayback() {
+  const out = { udpRoundTrip: await probeUdp(), tracks: [] };
+  console.log(`[${BOT_NAME}] probe: UDP round trip ${out.udpRoundTrip ? 'OK' : 'FAILED'}`);
+  const probes = [
+    { id: 'VHES-ZW8AZM', url: 'https://www.youtube.com/watch?v=VHES-ZW8AZM', title: 'Bizzy Banks - "Flashin Lights" [ Official Video ]', uploader: 'Bizzy Banks' },
+    await resolveTextQuery('5500 degrees est gee').catch(() => null),
+  ];
+  for (const track of probes) {
+    if (!track) continue;
+    const entry = { title: track.title };
+    try {
+      const t0 = Date.now();
+      const src = await resolvePlayable({ ...track }, { budgetMs: 35_000, priority: 'high' });
+      entry.resolveMs = Date.now() - t0;
+      if (typeof src === 'object') {
+        entry.source = 'play-dl stream';
+        entry.bytesIn5s = await countBytes(src.playDl.stream, 5_000);
+        try { src.playDl.stream.destroy(); } catch { /* done */ }
+      } else {
+        entry.source = `url: ${new URL(src).host}`;
+        const dummy = {};
+        createResource(src, false, dummy);
+        entry.bytesIn5s = await countBytes(dummy.ffmpeg.stdout, 5_000);
+        try { dummy.ffmpeg.kill(); } catch { /* done */ }
+      }
+    } catch (err) {
+      entry.error = errReason(err);
+    }
+    console.log(`[${BOT_NAME}] probe: "${entry.title}" -> ${entry.source || 'FAILED'} | ${entry.bytesIn5s ?? 0} bytes in 5s${entry.error ? ` | ${entry.error}` : ''}`);
+    out.tracks.push(entry);
+  }
+  return out;
 }
 
 function startTrack(state, guildId, track) {
