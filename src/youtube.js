@@ -3,8 +3,51 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
+// Node IS present wherever this bot runs (the Docker image is Node 20), and
+// YouTube extraction needs a JS runtime for its player challenges — without
+// this yt-dlp warns "No supported JavaScript runtime could be found" and
+// stream extraction fails far more often. Passed on every yt-dlp call.
+const JS_RUNTIME_ARGS = ['--js-runtimes', 'node'];
+
 function yt(args, { timeout = 45000 } = {}) {
-  return execFileAsync('yt-dlp', args, { timeout, maxBuffer: 16 * 1024 * 1024 });
+  return execFileAsync('yt-dlp', [...JS_RUNTIME_ARGS, ...args], { timeout, maxBuffer: 16 * 1024 * 1024 });
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function isRateLimited(err) {
+  return /HTTP Error 429|Too Many Requests/i.test(`${err?.stderr || ''} ${err?.message || ''}`);
+}
+
+/**
+ * yt() for metadata / search / resolve calls, with backoff on HTTP 429.
+ * YouTube rate-limits datacenter IPs in bursts; firing parallel lookups
+ * into a 429 used to fail the whole batch instantly. Two retries
+ * (1.5s, then 4s) ride out most bursts. Non-429 errors throw at once.
+ */
+async function ytMeta(args, opts) {
+  const BACKOFF = [1500, 4000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await yt(args, opts);
+    } catch (err) {
+      if (!isRateLimited(err) || attempt >= BACKOFF.length) throw err;
+      await sleep(BACKOFF[attempt]);
+    }
+  }
+}
+
+/**
+ * Stream extractions are serialized: at most ONE runs at a time, process
+ * wide. Parallel -g lookups from one IP are exactly what trips YouTube's
+ * 429 wall; a queue costs a little latency and buys a lot of reliability.
+ * Prefetch and play-time resolution both pass through this lock.
+ */
+let streamChain = Promise.resolve();
+function withStreamLock(fn) {
+  const run = streamChain.then(fn, fn);
+  streamChain = run.then(() => {}, () => {});
+  return run;
 }
 
 /** Returns yt-dlp version string, or null if the binary is missing. */
@@ -58,13 +101,13 @@ function searchFirstLine(stdout) {
 export async function resolveTrack(query) {
   const q = query.trim();
   if (/^https?:\/\//i.test(q)) {
-    const { stdout } = await yt(['--no-playlist', '--skip-download', '--print', PRINT, q]);
+    const { stdout } = await ytMeta(['--no-playlist', '--skip-download', '--print', PRINT, q]);
     return searchFirstLine(stdout);
   }
   const sc = q.match(/^(?:sc:|soundcloud:)\s*(.+)/i);
   const target = sc ? sc[1] : q;
   const prefix = sc ? 'scsearch1:' : 'ytsearch1:';
-  const { stdout } = await yt([
+  const { stdout } = await ytMeta([
     '--no-playlist',
     '--skip-download',
     '--print',
@@ -80,7 +123,7 @@ export async function resolveTrack(query) {
  */
 export async function findOnYouTube(title, artist) {
   const q = `${title} ${artist || ''}`.trim();
-  const { stdout } = await yt([
+  const { stdout } = await ytMeta([
     '--no-playlist',
     '--skip-download',
     '--print',
@@ -94,26 +137,154 @@ export async function findOnYouTube(title, artist) {
   }
 }
 
+/** Strip the decorations YouTube titles carry, for search queries. */
+function cleanTitleForSearch(title) {
+  return String(title || '')
+    .replace(/\s*[\(\[][^)\]]*(official|music video|lyric|audio|visualizer|hd|4k)[^)\]]*[\)\]]/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Run a yt-dlp search (ytsearch / scsearch) and parse up to n tracks. */
+async function searchTracks(prefix, query, n = 5) {
+  const { stdout } = await ytMeta([
+    '--no-playlist',
+    '--skip-download',
+    '--print',
+    PRINT,
+    `${prefix}${n}:${query}`,
+  ]);
+  return stdout
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l) => { try { return parseTrackLine(l); } catch { return null; } })
+    .filter(Boolean);
+}
+
+/** Up to 5 YouTube search results for a { title, artist } pair. */
+export function searchOnYouTube(title, artist) {
+  const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
+  return searchTracks('ytsearch', q);
+}
+
+/** Up to 5 SoundCloud search results for a { title, artist } pair. */
+export function searchOnSoundCloud(title, artist) {
+  const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
+  return searchTracks('scsearch', q);
+}
+
+/**
+ * Find the best SoundCloud match for a { title, artist } pair.
+ * The player's safety net: when YouTube bot-walls this host entirely,
+ * the same song is streamed from soundcloud.com instead — SoundCloud
+ * does not bot-wall datacenter IPs.
+ */
+export async function findOnSoundCloud(title, artist) {
+  const results = await searchOnSoundCloud(title, artist);
+  if (!results.length) {
+    throw new Error(`No SoundCloud match for "${`${title} ${artist || ''}`.trim()}"`);
+  }
+  return results[0];
+}
+
+/**
+ * One stream extraction attempt for a page URL, quality-first: the
+ * format selector takes the best audio the response offers (bestaudio),
+ * and the format sort ranks by bitrate with Opus preferred — Opus also
+ * matters downstream, because an Opus/WebM stream passes through the
+ * voice layer without a re-encode, while anything else is transcoded.
+ * Returns { url, formatId, audioOnly, abr } — abr in kbps, null when
+ * the source doesn't report one.
+ */
+async function extractStream(target, extraArgs = []) {
+  const { stdout } = await yt([
+    '--no-playlist',
+    '-f',
+    'bestaudio/best',
+    '--format-sort',
+    'abr,acodec:opus',
+    ...extraArgs,
+    '--print',
+    '%(format_id)s\t%(vcodec)s\t%(abr)s\t%(url)s',
+    target,
+  ]);
+  const line = stdout.trim().split('\n')[0] || '';
+  const [formatId, vcodec, abrRaw, url] = line.split('\t');
+  if (!url || !url.startsWith('http')) throw new Error('Could not get an audio stream.');
+  return {
+    url,
+    formatId: formatId || '?',
+    audioOnly: vcodec === 'none',
+    abr: Number(abrRaw) > 0 ? Number(abrRaw) : null,
+  };
+}
+
+// YouTube player clients tried, in order, for stream extraction. The
+// default web client is the one YouTube bot-walls on datacenter IPs
+// ("Sign in to confirm you're not a bot" / HTTP 429); the app and TV
+// clients are challenged far less, so they go first. One attempt each.
+const YT_PLAYER_CLIENTS = ['android', 'ios', 'tv', 'web_embedded', 'web'];
+
+/** Is candidate stream `a` strictly better than `b`? Audio-only beats
+ *  muxed (its audio bitrate is almost always higher, and it avoids a
+ *  video download); then higher bitrate wins. */
+function streamBeats(a, b) {
+  if (a.audioOnly !== b.audioOnly) return a.audioOnly;
+  return (a.abr || 0) > (b.abr || 0);
+}
+
+function describeStream(s) {
+  return `fmt ${s.formatId}${s.abr ? ` ~${Math.round(s.abr)}kbps` : ''}${s.audioOnly ? '' : ' (muxed)'}`;
+}
+
 /**
  * Direct audio stream URL for a track (the URL itself expires after a few
  * hours — fine for a queue). YouTube tracks stream from their watch page;
  * other services (SoundCloud) stream from the track's own page URL, which
  * yt-dlp also knows how to read — pass it as pageUrl when the track has one.
+ *
+ * YouTube targets rotate through YT_PLAYER_CLIENTS, quality-first: a
+ * proper audio-only stream at a good bitrate is accepted on the spot,
+ * but a client that only offers a low or muxed format doesn't end the
+ * search — the remaining clients still get their one attempt each, and
+ * the best result overall wins. Attempts stay bounded (one per client).
+ * All extractions are serialized through withStreamLock (see above) so
+ * prefetch and play-time lookups never stampede YouTube in parallel.
  */
 export async function streamUrlFor(videoId, pageUrl) {
   const target = pageUrl && /^https?:\/\//i.test(pageUrl)
     ? pageUrl
     : `https://www.youtube.com/watch?v=${videoId}`;
-  const { stdout } = await yt([
-    '--no-playlist',
-    '-f',
-    'bestaudio[ext=webm]/bestaudio/best',
-    '-g',
-    target,
-  ]);
-  const url = stdout.trim().split('\n')[0];
-  if (!url.startsWith('http')) throw new Error('Could not get an audio stream.');
-  return url;
+  return withStreamLock(async () => {
+    if (!/(^|\.)youtube\.com|(^|\.)youtu\.be/i.test(new URL(target).hostname)) {
+      const s = await extractStream(target);
+      return s.url;
+    }
+    let best = null;
+    let lastErr = null;
+    for (const client of YT_PLAYER_CLIENTS) {
+      let s;
+      try {
+        s = await extractStream(target, [
+          '--extractor-args', `youtube:player_client=${client}`,
+        ]);
+      } catch (err) {
+        lastErr = err;
+        continue;
+      }
+      const candidate = { ...s, client };
+      if (candidate.audioOnly && (candidate.abr === null || candidate.abr >= 96)) {
+        console.log(`[Swamp Tunes] stream extracted via youtube client "${client}" (${describeStream(candidate)})`);
+        return candidate.url;
+      }
+      if (!best || streamBeats(candidate, best)) best = candidate;
+    }
+    if (best) {
+      console.log(`[Swamp Tunes] stream extracted via youtube client "${best.client}" (${describeStream(best)})`);
+      return best.url;
+    }
+    throw lastErr || new Error('Could not get an audio stream.');
+  });
 }
 
 // --- Playlists (YouTube playlists and SoundCloud sets) ---------------------
@@ -169,7 +340,7 @@ async function resolveYouTubePlaylist(listId) {
   try {
     // --flat-playlist: entries come back with id/title/duration/uploader in
     // one fast pass instead of a full extraction per video.
-    const { stdout } = await yt([
+    const { stdout } = await ytMeta([
       '--flat-playlist',
       '-J',
       '--playlist-end', String(PLAYLIST_CAP),
@@ -217,7 +388,7 @@ async function resolveSoundCloudSet(url) {
   // titles), then each track is resolved for metadata like a single play.
   let entries;
   try {
-    const { stdout } = await yt([
+    const { stdout } = await ytMeta([
       '--flat-playlist',
       '-J',
       '--playlist-end', String(PLAYLIST_CAP),
