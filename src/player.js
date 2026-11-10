@@ -10,7 +10,7 @@ import {
   entersState,
 } from '@discordjs/voice';
 import { EmbedBuilder } from 'discord.js';
-import { streamUrlFor, formatDuration } from './youtube.js';
+import { streamUrlFor, searchOnSoundCloud, searchOnYouTube, formatDuration } from './youtube.js';
 import { applyTheme } from './themes.js';
 
 export const BRAND = 0x2d6a4f; // swamp green
@@ -174,18 +174,116 @@ function createResource(url, bassBoost, state) {
   return createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
 }
 
+/**
+ * Same-song check for fallback candidates. The fallback's job is to find
+ * the EXACT song the user asked for on a reachable host — never a loose
+ * namesake. Both sides are normalized (lowercased, bracketed decorations
+ * and channel suffixes stripped) and compared as word tokens:
+ * - at least 60% of the requested title's words must appear in the
+ *   candidate's title + uploader, with at least 2 words matching
+ *   (a 1-word title must match whole), and
+ * - when the artist is known, the two sides must share an artist word:
+ *   one of the artist's words in the candidate's title/uploader, or one
+ *   of the candidate uploader's words in the requested title (covers
+ *   "Artist - Title" uploads where either side credits the other
+ *   artist). A shared title alone is never enough when the artist is
+ *   known — an identical title by a different artist is a different
+ *   song, and playing it would break the rule this check exists for.
+ */
+function normTokens(text) {
+  return new Set(
+    String(text || '')
+      .toLowerCase()
+      .replace(/\[[^\]]*\]|\([^)]*\)/g, ' ')
+      .replace(/&/g, ' and ')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(' ')
+      .map((w) => w.trim())
+      .filter((w) => w.length > 1),
+  );
+}
+
+const ARTIST_STOPWORDS = new Set(['official', 'topic', 'vevo', 'music', 'records', 'recordings', 'entertainment', 'tv']);
+
+export function isSameSong(requested, candidate) {
+  if (!requested?.title || !candidate?.title) return false;
+  const reqTokens = normTokens(requested.title);
+  if (!reqTokens.size) return false;
+  const candTokens = normTokens(`${candidate.title} ${candidate.uploader || ''}`);
+  let matched = 0;
+  for (const t of reqTokens) if (candTokens.has(t)) matched++;
+  const titleScore = matched / reqTokens.size;
+  const minMatched = reqTokens.size === 1 ? 1 : 2;
+  if (matched < minMatched || titleScore < 0.6) return false;
+  const artistWords = [...normTokens(requested.uploader || requested.artist || '')]
+    .filter((w) => !ARTIST_STOPWORDS.has(w));
+  if (!artistWords.length) return true;
+  if (artistWords.some((w) => candTokens.has(w))) return true;
+  const candUploaderWords = [...normTokens(candidate.uploader || '')]
+    .filter((w) => !ARTIST_STOPWORDS.has(w));
+  return candUploaderWords.some((w) => reqTokens.has(w));
+}
+
+/**
+ * Resolve the URL a track will actually play from, at stream-start time.
+ * Order: local file → prefetched URL (instant) → in-flight prefetch →
+ * fresh extraction. If YouTube extraction fails outright (its bot wall
+ * rejects datacenter IPs no matter which player client asks), the SAME
+ * song is hunted down elsewhere, in order:
+ * 1. SoundCloud — searched by title + artist, and a candidate only
+ *    plays if it passes isSameSong against the requested track.
+ * 2. YouTube again via plain search — a different upload of the same
+ *    song often extracts when the linked one is walled or gone; same
+ *    isSameSong gate, and never the very video that just failed.
+ * Only when neither host has the exact song reachable does the track
+ * skip, as before. Whichever URL wins is cached on the track, so a
+ * replay or bass-boost toggle doesn't pay the lookup again. Tracks
+ * that already live on SoundCloud get no fallback (there is nothing
+ * behind them). The queue entry, title and now-playing flow never
+ * change — only the host behind the song does.
+ */
+async function playableUrlFor(track) {
+  if (track.isLocal) return track.localFile;
+  if (track.streamUrl) return track.streamUrl; // prefetched — start instantly
+  if (track.streamPromise) {
+    const warmed = await track.streamPromise; // prefetch in flight
+    if (warmed) return warmed;
+  }
+  try {
+    return await streamUrlFor(track.id, track.url);
+  } catch (err) {
+    if (/soundcloud\.com/i.test(track.url || '')) throw err;
+    const artist = track.uploader || track.artist || '';
+    // 1) The same song on SoundCloud.
+    try {
+      const candidates = await searchOnSoundCloud(track.title, artist);
+      const match = candidates.find((c) => isSameSong(track, c));
+      if (match) {
+        const url = await streamUrlFor(match.id, match.url);
+        track.streamUrl = url;
+        console.log(`[${BOT_NAME}] YouTube blocked, fell back to SoundCloud for "${track.title}"`);
+        return url;
+      }
+    } catch { /* no reachable SoundCloud copy — try the re-search below */ }
+    // 2) The same song through a fresh YouTube search (different upload).
+    try {
+      const candidates = await searchOnYouTube(track.title, artist);
+      const match = candidates.find((c) => c.id !== track.id && isSameSong(track, c));
+      if (match) {
+        const url = await streamUrlFor(match.id, match.url);
+        track.streamUrl = url;
+        console.log(`[${BOT_NAME}] YouTube blocked "${track.title}", playing another upload of the same song found via search`);
+        return url;
+      }
+    } catch { /* nothing reachable — the skip below is honest */ }
+    throw err;
+  }
+}
+
 function startTrack(state, guildId, track) {
   killFfmpeg(state);
   return (async () => {
-    let url;
-    if (track.isLocal) {
-      url = track.localFile;
-    } else if (track.streamUrl) {
-      url = track.streamUrl; // prefetched — start instantly
-    } else {
-      if (track.streamPromise) url = await track.streamPromise; // prefetch in flight
-      if (!url) url = await streamUrlFor(track.id, track.url); // fall back to resolving now
-    }
+    const url = await playableUrlFor(track);
     if (!url) throw new Error('No playable source for this track.');
     const resource = createResource(url, state.bassBoost, state);
     resource.volume?.setVolume(state.volume);
