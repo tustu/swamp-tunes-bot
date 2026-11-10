@@ -161,14 +161,21 @@ function prefetchNext(guildId) {
   if (state?.queue[0]) prefetchTrack(state.queue[0]);
 }
 
-function createResource(url, bassBoost, state) {
-  if (!bassBoost) return createAudioResource(url, { inlineVolume: true });
-  // Route audio through ffmpeg with a bass boost filter.
+export function createResource(url, bassBoost, state) {
+  // EVERY track plays through ffmpeg, the classic direct-player shape:
+  // ffmpeg reads the stream itself with reconnect switched on (a dropped
+  // connection rejoins instead of killing the song), video is disabled,
+  // and clean 48kHz PCM comes out the pipe for the voice encoder. Handing
+  // the bare URL to the voice library instead left playback at the mercy
+  // of its probe/transcode path — and with no opus encoder installed
+  // that path died on every non-Opus stream (the Nov 9 production bug:
+  // songs resolved, then "Cannot find module '@discordjs/opus'").
   const ff = spawn('ffmpeg', [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
     '-analyzeduration', '0', '-loglevel', '0',
     '-i', url,
-    '-vn', '-af', 'bass=g=15:f=110',
+    '-vn',
+    ...(bassBoost ? ['-af', 'bass=g=15:f=110'] : []),
     '-f', 's16le', '-ar', '48000', '-ac', '2',
     'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'ignore'] });
