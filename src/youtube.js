@@ -496,7 +496,15 @@ export async function streamUrlFor(videoId, pageUrl, opts = {}) {
 // official instance list (only instances that report their API enabled),
 // cached for an hour, with the last instance verified live (Nov 2026) as
 // the seed. At most 2 instances are tried per lookup, on tight timeouts.
-const INVIDIOUS_SEED = ['yt.chocolatemoo53.com'];
+const INVIDIOUS_SEED = [
+  'yt.chocolatemoo53.com',
+  'inv.nadeko.net',
+  'yewtu.be',
+  'invidious.jing.rocks',
+  'iv.datura.network',
+  'invidious.nerdvpn.de',
+  'inv.us.projectsegfau.lt',
+];
 let invidiousCache = { at: 0, hosts: INVIDIOUS_SEED };
 
 async function invidiousHosts() {
@@ -589,7 +597,7 @@ export async function invidiousStreamFor(videoId, opts = {}) {
   const deadline = opts.deadline || null;
   const hosts = await invidiousHosts();
   let lastErr = null;
-  for (const host of hosts.slice(0, 3)) {
+  for (const host of hosts.slice(0, 4)) {
     const budget = deadline ? deadline - Date.now() : (opts.timeoutMs || 10_000);
     if (budget <= 500) { lastErr = lastErr || new Error('Invidious lookup ran out of time'); break; }
     try {
@@ -615,6 +623,7 @@ export async function invidiousStreamFor(videoId, opts = {}) {
         format: `${String(best.type).split(';')[0]} ~${Math.round((best.bitrate || 0) / 1000)}kbps`,
       };
     } catch (err) {
+      console.log(`[Swamp Tunes] invidious via ${host}: ${errReason(err)}`);
       lastErr = err;
     }
   }
