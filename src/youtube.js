@@ -571,7 +571,7 @@ export async function invidiousStreamFor(videoId, opts = {}) {
     const budget = deadline ? deadline - Date.now() : (opts.timeoutMs || 10_000);
     if (budget <= 500) { lastErr = lastErr || new Error('Invidious lookup ran out of time'); break; }
     try {
-      const res = await fetch(`https://${host}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+      const res = await fetch(`https://${host}/api/v1/videos/${encodeURIComponent(videoId)}?local=true`, {
         signal: AbortSignal.timeout(Math.min(opts.timeoutMs || 10_000, budget)),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
