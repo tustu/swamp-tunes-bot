@@ -257,6 +257,8 @@ const RESOLVE_BUDGET_MS = 40_000;
 const PREFETCH_BUDGET_MS = 20_000;
 
 /** Coverage of the requested title's distinctive (non-artist) words, 0..1. */
+const VERSION_WORDS = new Set(['fast', 'sped', 'slowed', 'remix', 'cover', 'karaoke', 'instrumental', 'nightcore', 'reverb', 'jersey']);
+
 function titleScore(requested, candidate) {
   const reqAll = normTokens(requested.title);
   if (!reqAll.size) return 0;
@@ -269,7 +271,16 @@ function titleScore(requested, candidate) {
   const cand = normTokens(`${candidate.title} ${candidate.uploader || ''}`);
   let matched = 0;
   for (const t of req) if (cand.has(t)) matched++;
-  return matched / req.size;
+  let score = matched / req.size;
+  // A same-song re-upload that is a VERSION (sped-up "Fast", remix,
+  // nightcore…) covers every title word and ties with the plain song at
+  // 1.0. When the request never asked for a version, rank those below
+  // the plain upload — versions only win when nothing plain is offered.
+  const candTitle = normTokens(candidate.title);
+  for (const w of candTitle) {
+    if (VERSION_WORDS.has(w) && !reqAll.has(w)) score -= 0.15;
+  }
+  return Math.max(0, score);
 }
 
 /**
