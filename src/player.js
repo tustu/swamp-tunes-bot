@@ -473,7 +473,12 @@ async function verifyFlows(url, trackTitle, probeMs) {
   const bytes = await new Promise((resolve) => {
     let n = 0;
     const timer = setTimeout(() => resolve(n), probeMs);
-    ff.stdout.on('data', (d) => { n += d.length; });
+    ff.stdout.on('data', (d) => {
+      n += d.length;
+      // A live stream proves itself fast — don't make a good door
+      // pay the whole window. Only dead doors sit at zero to the end.
+      if (n >= FLOW_MIN_BYTES) { clearTimeout(timer); resolve(n); }
+    });
     ff.once('close', () => { clearTimeout(timer); resolve(n); });
   });
   try { ff.kill('SIGKILL'); } catch { /* already gone */ }
@@ -538,17 +543,33 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
         timeoutMs: Math.min(8_000, Math.max(1_000, remaining())),
       }));
     } catch (err) { noteFail('soundcloud api search', err); }
-    if (remaining() > 3_000) {
+    // Title-only API search too: appending a YouTube channel name
+    // ("LilBabyVEVO") as the "artist" poisons SoundCloud's ranking,
+    // while fan re-uploads are titled with the artist's real name —
+    // "Lil Baby - Life Of The Party" finds copies that the
+    // channel-name query never surfaces.
+    if (artist && remaining() > 3_000) {
+      try {
+        addAll(await searchOnSoundCloudApi(searchTitle, '', {
+          timeoutMs: Math.min(6_000, Math.max(1_000, remaining())),
+        }));
+      } catch (err) { noteFail('soundcloud api search (title only)', err); }
+    }
+    // The yt-dlp scsearch is the slow door (~10s): only pay for it
+    // when the API pools left the same-song gate nearly empty.
+    let ranked = rankedMatches(track, [...byId.values()])
+      .filter((c) => String(c.id) !== String(excludeId ?? ''));
+    if (ranked.length < 3 && remaining() > 12_000) {
       try {
         addAll(await searchOnSoundCloud(searchTitle, artist, {
-          timeoutMs: Math.min(15_000, remaining()),
+          timeoutMs: Math.min(10_000, remaining()),
           retry: false,
           n: 10,
         }));
       } catch (err) { noteFail('soundcloud search', err); }
+      ranked = rankedMatches(track, [...byId.values()])
+        .filter((c) => String(c.id) !== String(excludeId ?? ''));
     }
-    const ranked = rankedMatches(track, [...byId.values()])
-      .filter((c) => String(c.id) !== String(excludeId ?? ''));
     if (!ranked.length) {
       console.log(`[${BOT_NAME}] soundcloud: no exact-song match for "${track.title}"`);
       return null;
