@@ -505,6 +505,9 @@ function ensureConnection(state, guild, member) {
       selfDeaf: true,
     });
     state.connection.subscribe(state.player);
+    state.connection.on('stateChange', (oldS, newS) => {
+      console.log(`[${BOT_NAME}] voice: ${oldS.status} -> ${newS.status}${newS.closeCode ? ` (close ${newS.closeCode})` : ''}`);
+    });
     state.connection.on(VoiceConnectionStatus.Disconnected, async () => {
       try {
         await Promise.race([
@@ -532,6 +535,9 @@ function ensureConnection(state, guild, member) {
       selfDeaf: true,
     });
     state.connection.subscribe(state.player);
+    state.connection.on('stateChange', (oldS, newS) => {
+      console.log(`[${BOT_NAME}] voice: ${oldS.status} -> ${newS.status}${newS.closeCode ? ` (close ${newS.closeCode})` : ''}`);
+    });
   }
 }
 
