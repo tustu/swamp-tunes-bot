@@ -393,10 +393,21 @@ function rankedMatches(requested, candidates) {
  * entry, title and now-playing flow never change; only the host behind
  * the song does.
  */
+/** Strip video-title decoration ('[ Official Video ]', quotes) for search queries. */
+function cleanSongQuery(title) {
+  return String(title || '')
+    .replace(/\[[^\]]*\]/g, ' ')
+    .replace(/\((?:official|music|lyric|audio|video|hd|4k)[^)]*\)/gi, ' ')
+    .replace(/["""]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority = 'high' } = {}) {
   const deadline = Date.now() + budgetMs;
   const remaining = () => deadline - Date.now();
   const artist = track.uploader || track.artist || '';
+  const searchTitle = cleanSongQuery(track.title) || track.title;
   const isSCTrack = /soundcloud\.com/i.test(track.url || '');
   let lastErr = null;
   const noteFail = (label, err) => {
@@ -407,13 +418,13 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
   const trySoundCloudSearch = async (excludeId) => {
     let candidates = [];
     try {
-      candidates = await searchOnSoundCloudApi(track.title, artist, {
+      candidates = await searchOnSoundCloudApi(searchTitle, artist, {
         timeoutMs: Math.min(8_000, Math.max(1_000, remaining())),
       });
     } catch (err) { noteFail('soundcloud api search', err); }
     if (!candidates.length && remaining() > 3_000) {
       try {
-        candidates = await searchOnSoundCloud(track.title, artist, {
+        candidates = await searchOnSoundCloud(searchTitle, artist, {
           timeoutMs: Math.min(15_000, remaining()),
           retry: false,
         });
@@ -493,7 +504,7 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
   if (remaining() > 3_000) {
     let candidates = [];
     try {
-      candidates = await searchOnYouTube(track.title, artist, {
+      candidates = await searchOnYouTube(searchTitle, artist, {
         timeoutMs: Math.min(15_000, remaining()),
         retry: false,
       });
