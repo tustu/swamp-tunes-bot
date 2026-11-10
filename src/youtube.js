@@ -161,6 +161,12 @@ export async function resolveTextQuery(query) {
   if (!sc) {
     const viaApi = await searchOnSoundCloudApi(text, '', { timeoutMs: 6_000 }).catch(() => []);
     if (viaApi.length) return viaApi[0];
+    // Not on SoundCloud: resolve the name against YouTube's own catalog
+    // through an Invidious instance (YouTube search itself is walled
+    // from this host; the instance is not). The returned track carries
+    // the real video id, and the player streams it via Invidious too.
+    const viaInv = await searchOnInvidious(text).catch(() => []);
+    if (viaInv.length) return viaInv[0];
   }
   const viaScSearch = await searchOnSoundCloud(text, '', { timeoutMs: 10_000, retry: false }).catch(() => []);
   if (viaScSearch.length) return viaScSearch[0];
@@ -431,6 +437,45 @@ async function invidiousHosts() {
     if (ordered.length) invidiousCache = { at: Date.now(), hosts: ordered };
   } catch { /* keep the seed / previous cache */ }
   return invidiousCache.hosts;
+}
+
+/**
+ * Search YouTube's catalog through a public Invidious instance's API —
+ * the same side door invidiousStreamFor streams through. YouTube's own
+ * search is walled from datacenter IPs, but an instance answers from
+ * its network, so a typed song name can still resolve to the actual
+ * YouTube video. Returns track-shaped results; [] on any failure.
+ */
+export async function searchOnInvidious(query, opts = {}) {
+  const hosts = await invidiousHosts();
+  const timeoutMs = opts.timeoutMs || 6_000;
+  for (const host of hosts.slice(0, 2)) {
+    try {
+      const res = await fetch(
+        `https://${host}/api/v1/search?q=${encodeURIComponent(query)}&type=video&fields=videoId,title,author,lengthSeconds,videoThumbnails`,
+        { signal: AbortSignal.timeout(timeoutMs) },
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      const tracks = (Array.isArray(data) ? data : [])
+        .filter((v) => v && v.videoId && v.title)
+        .map((v) => {
+          const thumbs = Array.isArray(v.videoThumbnails) ? v.videoThumbnails : [];
+          const thumb = thumbs.find((t) => t.quality === 'maxres') || thumbs[0];
+          const track = {
+            id: v.videoId,
+            title: String(v.title).replace(/\s+/g, ' ').trim(),
+            duration: Number(v.lengthSeconds) || 0,
+            url: `https://www.youtube.com/watch?v=${v.videoId}`,
+          };
+          if (v.author) track.uploader = String(v.author).replace(/\s+/g, ' ').trim();
+          if (thumb?.url) track.thumbnail = thumb.url.startsWith('http') ? thumb.url : `https://${host}${thumb.url}`;
+          return track;
+        });
+      if (tracks.length) return tracks;
+    } catch { /* try the next instance */ }
+  }
+  return [];
 }
 
 /**
