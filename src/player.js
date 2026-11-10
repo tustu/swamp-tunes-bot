@@ -190,27 +190,55 @@ function prefetchNext(guildId) {
   if (state?.queue[0]) prefetchTrack(state.queue[0]);
 }
 
-export function createResource(url, bassBoost, state) {
+export function createResource(url, bassBoost, state, trackTitle = '') {
   // EVERY track plays through ffmpeg, the classic direct-player shape:
-  // ffmpeg reads the stream itself with reconnect switched on (a dropped
-  // connection rejoins instead of killing the song), video is disabled,
-  // and clean 48kHz PCM comes out the pipe for the voice encoder. Handing
-  // the bare URL to the voice library instead left playback at the mercy
-  // of its probe/transcode path — and with no opus encoder installed
-  // that path died on every non-Opus stream (the Nov 9 production bug:
-  // songs resolved, then "Cannot find module '@discordjs/opus'").
+  // ffmpeg reads the stream itself, video is disabled, and clean 48kHz
+  // PCM comes out the pipe for the voice encoder.
+  //
+  // The -reconnect flags are HTTP-protocol options, so they are passed
+  // ONLY for http(s) inputs. Passed unconditionally (the old shape),
+  // ffmpeg validates them against the input and, for anything that is
+  // not the HTTP protocol — a local upload file above all — exits
+  // instantly with "Option reconnect not found", producing ZERO bytes:
+  // the song "played" for a split second in total silence. Verified
+  // against the exact deployed binary (Debian bookworm ffmpeg 5.1.9):
+  // file input + reconnect flags = 0 bytes out; without them the same
+  // file decodes in full. (ffmpeg-static 7.0.2 also zeroed HLS inputs
+  // with these flags; 5.1.9 and 8.1.2 tolerate them for http/HLS.)
+  const isHttp = /^https?:\/\//i.test(String(url));
   const ff = spawn(FFMPEG, [
-    '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-analyzeduration', '0', '-loglevel', '0',
+    ...(isHttp ? ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'] : []),
+    '-analyzeduration', '0', '-loglevel', 'error',
     '-i', url,
     '-vn',
     ...(bassBoost ? ['-af', 'bass=g=15:f=110'] : []),
     '-f', 's16le', '-ar', '48000', '-ac', '2',
     'pipe:1',
-  ], { stdio: ['ignore', 'pipe', 'ignore'] });
+  ], { stdio: ['ignore', 'pipe', 'pipe'] });
   state.ffmpeg = ff;
-  ff.on('error', () => {});
+  watchFfmpeg(ff, trackTitle);
   return createAudioResource(ff.stdout, { inputType: StreamType.Raw, inlineVolume: true });
+}
+
+/**
+ * ffmpeg used to run with stderr thrown away (-loglevel 0, stdio
+ * 'ignore'), so when it died — bad option, dead URL, 403 — the song
+ * simply ended and NOTHING anywhere said why. Now a dying ffmpeg is
+ * loud in the server log (console only, never the Discord channel):
+ * keep a short stderr tail and print it, with the exit code, on close.
+ */
+function watchFfmpeg(ff, trackTitle) {
+  let errTail = '';
+  ff.stderr?.on('data', (d) => { errTail = (errTail + d.toString()).slice(-600); });
+  ff.on('error', (err) => {
+    console.error(`[${BOT_NAME}] ffmpeg failed to start for "${trackTitle}":`, err.message);
+  });
+  ff.on('close', (code) => {
+    if (code) {
+      const last = errTail.trim().split('\n').filter(Boolean).pop() || 'no stderr';
+      console.error(`[${BOT_NAME}] ffmpeg exited ${code} for "${trackTitle}": ${last}`);
+    }
+  });
 }
 
 /**
@@ -218,17 +246,17 @@ export function createResource(url, bassBoost, state) {
  * same ffmpeg stage every other source uses, so volume, bass boost and
  * the opus pipeline behave identically whatever door the song came in.
  */
-export function createPlayDlResource(playDlInfo, bassBoost, state) {
+export function createPlayDlResource(playDlInfo, bassBoost, state, trackTitle = '') {
   const ff = spawn(FFMPEG, [
-    '-analyzeduration', '0', '-loglevel', '0',
+    '-analyzeduration', '0', '-loglevel', 'error',
     '-i', 'pipe:0',
     '-vn',
     ...(bassBoost ? ['-af', 'bass=g=15:f=110'] : []),
     '-f', 's16le', '-ar', '48000', '-ac', '2',
     'pipe:1',
-  ], { stdio: ['pipe', 'pipe', 'ignore'] });
+  ], { stdio: ['pipe', 'pipe', 'pipe'] });
   state.ffmpeg = ff;
-  ff.on('error', () => {});
+  watchFfmpeg(ff, trackTitle);
   ff.stdin.on('error', () => {});
   const input = playDlInfo.stream;
   input.on('error', () => { try { ff.stdin.destroy(); } catch { /* already gone */ } });
@@ -476,25 +504,6 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     if (viaSC) return viaSC;
   }
 
-  // Tier 1.5 — play-dl, for YouTube tracks SoundCloud could not place: opens the stream directly
-  // instead of asking yt-dlp to extract one, so YouTube's bot wall
-  // never gets a say. Tried after SoundCloud because from every
-  // network tested on Nov 9 it answered 429 and only added its
-  // timeout to songs SoundCloud places instantly. Returns a live stream object, not a URL;
-  // callers route it through the same ffmpeg stage as every source.
-  if (!isSCTrack && track.url && remaining() > 1_000) {
-    try {
-      const info = await withStreamTimeout(
-        playDl.stream(track.url),
-        Math.min(6_000, remaining()),
-        'play-dl',
-      );
-      console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
-      return { playDl: info };
-    } catch (err) { noteFail('play-dl', err); }
-  }
-
-
   // Tier 2 — Invidious: the same video through another front-end.
   // This door answers from the instance's network, so it goes BEFORE
   // the yt-dlp rotation: from a datacenter IP every walled rotation
@@ -509,12 +518,32 @@ async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority =
     } catch (err) { noteFail('invidious', err); }
   }
 
-  // Tier 3 — YouTube rotation on the track's own video (last resort:
-  // slow and walled from datacenter IPs).
+  // Tier 3 — YouTube rotation on the track's own video (slow and
+  // walled from datacenter IPs, but it is yt-dlp — the resolver that
+  // demonstrably still extracts from this class of host).
   if (!isSCTrack && track.id && remaining() > 1_000) {
     try {
       return await streamUrlFor(track.id, track.url, { priority, deadline });
     } catch (err) { noteFail('youtube', err); }
+  }
+
+  // Tier 3.5 — play-dl, last of the direct routes: opens the stream
+  // itself instead of asking yt-dlp to extract one. Demoted behind the
+  // yt-dlp rotation because from every network tested on Nov 9 it
+  // answered 429 and only added its timeout to the cascade; it stays
+  // in the chain because on a network where it does answer, it is a
+  // door nothing else duplicates. Returns a live stream object, not a
+  // URL; callers route it through the same ffmpeg stage as every source.
+  if (!isSCTrack && track.url && remaining() > 1_000) {
+    try {
+      const info = await withStreamTimeout(
+        playDl.stream(track.url),
+        Math.min(6_000, remaining()),
+        'play-dl',
+      );
+      console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
+      return { playDl: info };
+    } catch (err) { noteFail('play-dl', err); }
   }
 
   // Tier 3b — gated re-search: another upload of the same song, through
@@ -645,6 +674,16 @@ export async function probePlayback() {
   return out;
 }
 
+/** One-line host check for the boot log: can this host do UDP at all?
+ *  Discord voice MEDIA is UDP; the signalling that reports "ready" is
+ *  not. A host without UDP egress joins voice, looks healthy, and
+ *  plays silence forever — this line makes that diagnosable at boot. */
+export async function hostDiagnostics() {
+  const ok = await probeUdp();
+  console.log(`[${BOT_NAME}] host check: outbound UDP round trip ${ok ? 'OK' : 'FAILED — Discord voice media is UDP; on a host without UDP egress the bot joins voice and plays silence'}`);
+  return ok;
+}
+
 function startTrack(state, guildId, track) {
   killFfmpeg(state);
   return (async () => {
@@ -656,10 +695,27 @@ function startTrack(state, guildId, track) {
     // the idle connection (close 4014, Nov 9).
     if (state.guild && state.pendingMember) {
       ensureConnection(state, state.guild, state.pendingMember);
+      // Never play into a connection that has not finished its voice
+      // handshake. Playing the moment joinVoiceChannel returns leaves
+      // the song riding a media path that may never come up. Wait for
+      // Ready; if it never comes, rejoin ONCE; if it still never
+      // comes, this track fails (loudly in the log) instead of
+      // "playing" a whole song of silence at the channel.
+      if (state.connection && state.connection.state.status !== VoiceConnectionStatus.Ready) {
+        try {
+          await entersState(state.connection, VoiceConnectionStatus.Ready, 20_000);
+        } catch {
+          console.error(`[${BOT_NAME}] voice connection never became Ready for "${track.title}" — rejoining once`);
+          try { state.connection.destroy(); } catch { /* already gone */ }
+          state.connection = null;
+          ensureConnection(state, state.guild, state.pendingMember);
+          await entersState(state.connection, VoiceConnectionStatus.Ready, 20_000);
+        }
+      }
     }
     const resource = typeof src === 'object'
-      ? createPlayDlResource(src.playDl, state.bassBoost, state)
-      : createResource(src, state.bassBoost, state);
+      ? createPlayDlResource(src.playDl, state.bassBoost, state, track.title)
+      : createResource(src, state.bassBoost, state, track.title);
     resource.volume?.setVolume(state.volume);
     state.player.play(resource);
     announce(state, { embeds: [nowPlayingEmbed(track, state, guildId)] });
@@ -691,7 +747,7 @@ function ensureConnection(state, guild, member) {
   if (!perms?.has('Connect') || !perms?.has('Speak')) {
     throw new Error(`I need **Connect** and **Speak** permissions in ${voiceChannel}.`);
   }
-  if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
+  const joinAndWire = () => {
     state.connection = joinVoiceChannel({
       channelId: voiceChannel.id,
       guildId: guild.id,
@@ -699,40 +755,69 @@ function ensureConnection(state, guild, member) {
       selfDeaf: true,
     });
     state.connection.subscribe(state.player);
-    state.connection.on('stateChange', (oldS, newS) => {
-      console.log(`[${BOT_NAME}] voice: ${oldS.status} -> ${newS.status}${newS.closeCode ? ` (close ${newS.closeCode})` : ''}`);
-    });
-    state.connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(state.connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(state.connection, VoiceConnectionStatus.Connecting, 5_000),
-        ]);
-      } catch {
-        killFfmpeg(state);
-        state.connection?.destroy();
-        state.connection = null;
-        cleanupLocalFile(state.current);
-        for (const t of state.queue) cleanupLocalFile(t);
-        state.queue.length = 0;
-        state.current = null;
-      }
-    });
+    wireConnection(state);
+  };
+  if (!state.connection || state.connection.state.status === VoiceConnectionStatus.Destroyed) {
+    joinAndWire();
   } else if (state.connection.joinConfig.channelId !== voiceChannel.id) {
     // User is in a different channel — move the bot to them.
     killFfmpeg(state);
     state.connection.destroy();
-    state.connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guild.id,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: true,
-    });
-    state.connection.subscribe(state.player);
-    state.connection.on('stateChange', (oldS, newS) => {
-      console.log(`[${BOT_NAME}] voice: ${oldS.status} -> ${newS.status}${newS.closeCode ? ` (close ${newS.closeCode})` : ''}`);
-    });
+    joinAndWire();
   }
+}
+
+/**
+ * Every listener a voice connection needs, attached on EVERY join —
+ * first join and channel moves alike. The move path used to attach
+ * only the logging listener, so after a move the disconnect recovery
+ * below silently stopped existing and a dropped connection left the
+ * player performing into the void.
+ *
+ * The networking half is the @discordjs/voice self-heal for the
+ * "connection says Ready, nobody hears anything" failure: on
+ * datacenter hosts the connection's UDP networking layer can die
+ * underneath a connection that still reports Ready, and its keep-alive
+ * interval keeps firing on the dead socket. On every networking state
+ * change, clear the stale interval and log the transition — the
+ * documented community workaround for voice 0.19, and the log line
+ * makes a silent failure diagnosable from the server log alone.
+ */
+function wireConnection(state) {
+  const connection = state.connection;
+  const onNetworkingStateChange = (_oldN, newN) => {
+    const udp = newN ? Reflect.get(newN, 'udp') : null;
+    if (udp?.keepAliveInterval) clearInterval(udp.keepAliveInterval);
+    console.log(`[${BOT_NAME}] voice networking: -> ${newN?.status ?? 'gone'}`);
+  };
+  // Attach to the networking object that exists at join time, then
+  // follow it whenever the connection swaps in a fresh one.
+  Reflect.get(connection.state, 'networking')?.on('stateChange', onNetworkingStateChange);
+  connection.on('stateChange', (oldS, newS) => {
+    console.log(`[${BOT_NAME}] voice: ${oldS.status} -> ${newS.status}${newS.closeCode ? ` (close ${newS.closeCode})` : ''}`);
+    const oldNetworking = Reflect.get(oldS, 'networking');
+    const newNetworking = Reflect.get(newS, 'networking');
+    if (oldNetworking !== newNetworking) {
+      oldNetworking?.off('stateChange', onNetworkingStateChange);
+      newNetworking?.on('stateChange', onNetworkingStateChange);
+    }
+  });
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      killFfmpeg(state);
+      connection.destroy();
+      if (state.connection === connection) state.connection = null;
+      cleanupLocalFile(state.current);
+      for (const t of state.queue) cleanupLocalFile(t);
+      state.queue.length = 0;
+      state.current = null;
+    }
+  });
 }
 
 /** Fail fast unless the user is in a voice channel the bot may speak in. */
