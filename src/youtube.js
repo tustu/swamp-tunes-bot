@@ -41,13 +41,40 @@ async function ytMeta(args, opts) {
  * Stream extractions are serialized: at most ONE runs at a time, process
  * wide. Parallel -g lookups from one IP are exactly what trips YouTube's
  * 429 wall; a queue costs a little latency and buys a lot of reliability.
- * Prefetch and play-time resolution both pass through this lock.
+ * The queue is two-lane: play-time lookups (priority 'high', the default)
+ * always jump ahead of queued prefetch lookups ('low') — a song somebody
+ * is waiting to hear never sits behind background warming. A lookup that
+ * is already running is never preempted, but it is timeout-bounded.
  */
-let streamChain = Promise.resolve();
-function withStreamLock(fn) {
-  const run = streamChain.then(fn, fn);
-  streamChain = run.then(() => {}, () => {});
-  return run;
+const streamWaiters = [];
+let streamRunning = false;
+
+function pumpStreamQueue() {
+  if (streamRunning) return;
+  const idx = streamWaiters.findIndex((w) => w.priority === 'high');
+  const next = idx >= 0 ? streamWaiters.splice(idx, 1)[0] : streamWaiters.shift();
+  if (!next) return;
+  streamRunning = true;
+  Promise.resolve()
+    .then(next.fn)
+    .then(next.resolve, next.reject)
+    .finally(() => { streamRunning = false; pumpStreamQueue(); });
+}
+
+function withStreamLock(fn, priority = 'high') {
+  return new Promise((resolve, reject) => {
+    streamWaiters.push({ fn, priority, resolve, reject });
+    pumpStreamQueue();
+  });
+}
+
+/** The most informative one-liner from a yt-dlp / fetch failure, for logs. */
+export function errReason(err) {
+  const stderr = String(err?.stderr || '').trim();
+  const errLine = stderr.split('\n').map((l) => l.trim()).filter(Boolean)
+    .find((l) => /^ERROR/i.test(l)) || stderr.split('\n').filter((l) => l.trim()).pop();
+  const raw = errLine || String(err?.message || err || 'unknown error').split('\n')[0];
+  return raw.replace(/^ERROR:\s*/i, '').slice(0, 160);
 }
 
 /** Returns yt-dlp version string, or null if the binary is missing. */
@@ -145,15 +172,21 @@ function cleanTitleForSearch(title) {
     .trim();
 }
 
-/** Run a yt-dlp search (ytsearch / scsearch) and parse up to n tracks. */
-async function searchTracks(prefix, query, n = 5) {
-  const { stdout } = await ytMeta([
+/** Run a yt-dlp search (ytsearch / scsearch) and parse up to n tracks.
+ *  `-i` (--ignore-errors) matters: one DRM-protected or deleted entry in a
+ *  result set otherwise makes yt-dlp exit non-zero and throws the whole
+ *  batch away, including perfectly playable results (seen live with
+ *  SoundCloud search, where official uploads are often DRM-flagged). */
+async function searchTracks(prefix, query, n = 5, timeoutMs = 30_000, retry = true) {
+  const run = retry ? ytMeta : yt;
+  const { stdout } = await run([
+    '-i',
     '--no-playlist',
     '--skip-download',
     '--print',
     PRINT,
     `${prefix}${n}:${query}`,
-  ]);
+  ], { timeout: timeoutMs });
   return stdout
     .split('\n')
     .filter((l) => l.trim())
@@ -161,23 +194,24 @@ async function searchTracks(prefix, query, n = 5) {
     .filter(Boolean);
 }
 
-/** Up to 5 YouTube search results for a { title, artist } pair. */
-export function searchOnYouTube(title, artist) {
+/** Up to 5 YouTube search results for a { title, artist } pair.
+ *  opts: { timeoutMs, retry } — the player's cascade passes retry:false
+ *  so a 429 backoff can't overrun its hard per-track budget. */
+export function searchOnYouTube(title, artist, opts = {}) {
   const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
-  return searchTracks('ytsearch', q);
+  return searchTracks('ytsearch', q, 5, opts.timeoutMs, opts.retry !== false);
 }
 
 /** Up to 5 SoundCloud search results for a { title, artist } pair. */
-export function searchOnSoundCloud(title, artist) {
+export function searchOnSoundCloud(title, artist, opts = {}) {
   const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
-  return searchTracks('scsearch', q);
+  return searchTracks('scsearch', q, 5, opts.timeoutMs, opts.retry !== false);
 }
 
 /**
- * Find the best SoundCloud match for a { title, artist } pair.
- * The player's safety net: when YouTube bot-walls this host entirely,
- * the same song is streamed from soundcloud.com instead — SoundCloud
- * does not bot-wall datacenter IPs.
+ * Find the first SoundCloud match for a { title, artist } pair.
+ * Kept for compatibility; the player runs the fuller cascade in
+ * searchOnSoundCloudApi / searchOnSoundCloud + the same-song gate.
  */
 export async function findOnSoundCloud(title, artist) {
   const results = await searchOnSoundCloud(title, artist);
@@ -185,6 +219,45 @@ export async function findOnSoundCloud(title, artist) {
     throw new Error(`No SoundCloud match for "${`${title} ${artist || ''}`.trim()}"`);
   }
   return results[0];
+}
+
+/**
+ * Search SoundCloud through its own web API (api-v2), keyless — the same
+ * ships-in-the-page client id the set resolver scrapes. This is the
+ * player's PRIMARY search: it is fast (~1s vs ~10s+ for a yt-dlp
+ * search), and its ranking puts the artist's own upload first, where
+ * yt-dlp's scsearch often surfaces remixes and misses the song entirely
+ * (verified live: all three of a test batch were found here first try,
+ * two of them invisible to scsearch). Returns track-shaped results
+ * (same shape as parseTrackLine / scTrackShape). Returns [] on any
+ * failure — callers fall back to the yt-dlp search.
+ * Note the API also lists tracks whose only streams are SAMPLE-AES
+ * (FairPlay) DRM — those come back streamable here but fail extraction;
+ * the player iterates candidates until one actually extracts.
+ */
+export async function searchOnSoundCloudApi(title, artist, opts = {}) {
+  const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
+  const timeoutMs = opts.timeoutMs || 8_000;
+  let clientId = await getSoundCloudClientId().catch(() => null);
+  if (!clientId) return [];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await fetch(
+      `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${clientId}&limit=10`,
+      { headers: { 'User-Agent': SC_UA }, signal: AbortSignal.timeout(timeoutMs) },
+    );
+    if ((res.status === 401 || res.status === 403) && attempt === 0) {
+      scClientId = null; // rotated id — re-scrape and retry once
+      clientId = await getSoundCloudClientId().catch(() => null);
+      if (!clientId) return [];
+      continue;
+    }
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.collection || [])
+      .filter((t) => t && t.streamable !== false && t.title && t.permalink_url)
+      .map(scTrackShape);
+  }
+  return [];
 }
 
 /**
@@ -196,7 +269,7 @@ export async function findOnSoundCloud(title, artist) {
  * Returns { url, formatId, audioOnly, abr } — abr in kbps, null when
  * the source doesn't report one.
  */
-async function extractStream(target, extraArgs = []) {
+async function extractStream(target, extraArgs = [], timeoutMs = 15_000) {
   const { stdout } = await yt([
     '--no-playlist',
     '-f',
@@ -207,7 +280,7 @@ async function extractStream(target, extraArgs = []) {
     '--print',
     '%(format_id)s\t%(vcodec)s\t%(abr)s\t%(url)s',
     target,
-  ]);
+  ], { timeout: timeoutMs });
   const line = stdout.trim().split('\n')[0] || '';
   const [formatId, vcodec, abrRaw, url] = line.split('\t');
   if (!url || !url.startsWith('http')) throw new Error('Could not get an audio stream.');
@@ -247,27 +320,43 @@ function describeStream(s) {
  * proper audio-only stream at a good bitrate is accepted on the spot,
  * but a client that only offers a low or muxed format doesn't end the
  * search — the remaining clients still get their one attempt each, and
- * the best result overall wins. Attempts stay bounded (one per client).
- * All extractions are serialized through withStreamLock (see above) so
- * prefetch and play-time lookups never stampede YouTube in parallel.
+ * the best result overall wins.
+ *
+ * Budgets (opts): every attempt is capped at opts.attemptMs (default
+ * 15s) and the whole call gives up once opts.deadline (epoch ms) passes —
+ * a walled host must fail in seconds, not grind for minutes. All
+ * extractions are serialized through the two-lane stream lock (see
+ * above): opts.priority 'high' (play time, default) jumps queued
+ * prefetch ('low') lookups.
  */
-export async function streamUrlFor(videoId, pageUrl) {
+export async function streamUrlFor(videoId, pageUrl, opts = {}) {
   const target = pageUrl && /^https?:\/\//i.test(pageUrl)
     ? pageUrl
     : `https://www.youtube.com/watch?v=${videoId}`;
+  const priority = opts.priority || 'high';
+  const attemptMs = opts.attemptMs || 15_000;
+  const deadline = opts.deadline || null;
+  const attemptTimeout = () => {
+    const cap = deadline ? deadline - Date.now() : attemptMs;
+    return Math.max(1_500, Math.min(attemptMs, cap));
+  };
   return withStreamLock(async () => {
     if (!/(^|\.)youtube\.com|(^|\.)youtu\.be/i.test(new URL(target).hostname)) {
-      const s = await extractStream(target);
+      const s = await extractStream(target, [], attemptTimeout());
       return s.url;
     }
     let best = null;
     let lastErr = null;
     for (const client of YT_PLAYER_CLIENTS) {
+      if (deadline && Date.now() >= deadline) {
+        lastErr = lastErr || new Error('Stream lookup ran out of time');
+        break;
+      }
       let s;
       try {
         s = await extractStream(target, [
           '--extractor-args', `youtube:player_client=${client}`,
-        ]);
+        ], attemptTimeout());
       } catch (err) {
         lastErr = err;
         continue;
@@ -284,7 +373,75 @@ export async function streamUrlFor(videoId, pageUrl) {
       return best.url;
     }
     throw lastErr || new Error('Could not get an audio stream.');
-  });
+  }, priority);
+}
+
+// --- Invidious (a second front-end for the same YouTube videos) -----------
+
+// Public Invidious instances serve YouTube's own streams through their
+// API, from THEIR network — so a video YouTube refuses to hand this host
+// directly can still play, bit-for-bit the same upload. The instance
+// pool is small and churns, so hosts are discovered at runtime from the
+// official instance list (only instances that report their API enabled),
+// cached for an hour, with the last instance verified live (Nov 2026) as
+// the seed. At most 2 instances are tried per lookup, on tight timeouts.
+const INVIDIOUS_SEED = ['yt.chocolatemoo53.com'];
+let invidiousCache = { at: 0, hosts: INVIDIOUS_SEED };
+
+async function invidiousHosts() {
+  if (Date.now() - invidiousCache.at < 3_600_000 && invidiousCache.hosts.length) {
+    return invidiousCache.hosts;
+  }
+  try {
+    const res = await fetch('https://api.invidious.io/instances.json', {
+      signal: AbortSignal.timeout(6_000),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const list = await res.json();
+    const hosts = list
+      .filter(([, info]) => info && info.type === 'https' && info.api === true)
+      .map(([host]) => host);
+    // Seed first (it is the verified one), then any other API instances.
+    const ordered = [...INVIDIOUS_SEED, ...hosts.filter((h) => !INVIDIOUS_SEED.includes(h))];
+    if (ordered.length) invidiousCache = { at: Date.now(), hosts: ordered };
+  } catch { /* keep the seed / previous cache */ }
+  return invidiousCache.hosts;
+}
+
+/**
+ * Best audio stream for a YouTube video id, via a public Invidious
+ * instance. Returns { url, host, format }. Throws if no tried instance
+ * can serve the video.
+ */
+export async function invidiousStreamFor(videoId, opts = {}) {
+  const deadline = opts.deadline || null;
+  const hosts = await invidiousHosts();
+  let lastErr = null;
+  for (const host of hosts.slice(0, 2)) {
+    const budget = deadline ? deadline - Date.now() : (opts.timeoutMs || 10_000);
+    if (budget <= 500) { lastErr = lastErr || new Error('Invidious lookup ran out of time'); break; }
+    try {
+      const res = await fetch(`https://${host}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+        signal: AbortSignal.timeout(Math.min(opts.timeoutMs || 10_000, budget)),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const audio = (data.adaptiveFormats || [])
+        .filter((f) => f && f.url && String(f.type || '').startsWith('audio'))
+        .sort((a, b) => ((/opus/i.test(b.type) ? 1 : 0) - (/opus/i.test(a.type) ? 1 : 0))
+          || ((b.bitrate || 0) - (a.bitrate || 0)));
+      if (!audio.length) throw new Error('no audio formats');
+      const best = audio[0];
+      return {
+        url: best.url,
+        host,
+        format: `${String(best.type).split(';')[0]} ~${Math.round((best.bitrate || 0) / 1000)}kbps`,
+      };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('No Invidious instance could serve that video.');
 }
 
 // --- Playlists (YouTube playlists and SoundCloud sets) ---------------------
@@ -421,9 +578,12 @@ async function resolveSoundCloudSet(url) {
  */
 let scClientId = null;
 
-async function getSoundCloudClientId(setUrl) {
+async function getSoundCloudClientId(pageUrl = 'https://soundcloud.com/') {
   if (scClientId) return scClientId;
-  const res = await fetch(setUrl, { headers: { 'User-Agent': SC_UA } });
+  const res = await fetch(pageUrl, {
+    headers: { 'User-Agent': SC_UA },
+    signal: AbortSignal.timeout(8_000),
+  });
   if (!res.ok) return null;
   const html = await res.text();
   const m = html.match(/window\.__sc_hydration = (\[[\s\S]*?\]);<\/script>/);
