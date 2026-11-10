@@ -278,13 +278,29 @@ function normTokens(text) {
 
 const ARTIST_STOPWORDS = new Set(['official', 'topic', 'vevo', 'music', 'records', 'recordings', 'entertainment', 'tv']);
 
+/**
+ * Droppin'-g spelling variants count as the same word: 'flashin' and
+ * 'flashing', 'talkin' and 'talking'. Without this, the exact-song
+ * gate rejected the only SoundCloud copy of Bizzy Banks' 'Flashin
+ * Lights' because the re-upload spelled it 'Flashing' (Nov 9).
+ */
+function tokenVariants(t) {
+  const out = [t];
+  if (t.endsWith('ing') && t.length > 4) out.push(t.slice(0, -1));
+  if (t.endsWith('in') && t.length > 3) out.push(`${t}g`);
+  return out;
+}
+function tokenHit(token, set) {
+  return tokenVariants(token).some((v) => set.has(v));
+}
+
 export function isSameSong(requested, candidate) {
   if (!requested?.title || !candidate?.title) return false;
   const reqTokens = normTokens(requested.title);
   if (!reqTokens.size) return false;
   const candTokens = normTokens(`${candidate.title} ${candidate.uploader || ''}`);
   let matched = 0;
-  for (const t of reqTokens) if (candTokens.has(t)) matched++;
+  for (const t of reqTokens) if (tokenHit(t, candTokens)) matched++;
   const titleScore = matched / reqTokens.size;
   const minMatched = reqTokens.size === 1 ? 1 : 2;
   if (matched < minMatched || titleScore < 0.6) return false;
@@ -300,7 +316,7 @@ export function isSameSong(requested, candidate) {
   const distinctiveTokens = [...reqTokens].filter((t) => !artistWords.includes(t));
   if (distinctiveTokens.length) {
     let matchedDistinctive = 0;
-    for (const t of distinctiveTokens) if (candTokens.has(t)) matchedDistinctive++;
+    for (const t of distinctiveTokens) if (tokenHit(t, candTokens)) matchedDistinctive++;
     const minDistinctive = distinctiveTokens.length === 1 ? 1 : 2;
     if (matchedDistinctive < minDistinctive || matchedDistinctive / distinctiveTokens.length < 0.6) {
       return false;
@@ -308,10 +324,10 @@ export function isSameSong(requested, candidate) {
   }
 
   if (!artistWords.length) return true;
-  if (artistWords.some((w) => candTokens.has(w))) return true;
+  if (artistWords.some((w) => tokenHit(w, candTokens))) return true;
   const candUploaderWords = [...normTokens(candidate.uploader || '')]
     .filter((w) => !ARTIST_STOPWORDS.has(w));
-  return candUploaderWords.some((w) => reqTokens.has(w));
+  return candUploaderWords.some((w) => tokenHit(w, reqTokens));
 }
 
 /**
@@ -327,7 +343,7 @@ const RESOLVE_BUDGET_MS = 40_000;
 const PREFETCH_BUDGET_MS = 20_000;
 
 /** Coverage of the requested title's distinctive (non-artist) words, 0..1. */
-const VERSION_WORDS = new Set(['fast', 'sped', 'slowed', 'remix', 'cover', 'karaoke', 'instrumental', 'nightcore', 'reverb', 'jersey']);
+const VERSION_WORDS = new Set(['fast', 'sped', 'slowed', 'remix', 'cover', 'karaoke', 'instrumental', 'nightcore', 'reverb', 'jersey', 'freestyle']);
 
 function titleScore(requested, candidate) {
   const reqAll = normTokens(requested.title);
@@ -340,7 +356,7 @@ function titleScore(requested, candidate) {
   const req = distinctive.size ? distinctive : reqAll;
   const cand = normTokens(`${candidate.title} ${candidate.uploader || ''}`);
   let matched = 0;
-  for (const t of req) if (cand.has(t)) matched++;
+  for (const t of req) if (tokenHit(t, cand)) matched++;
   let score = matched / req.size;
   // A same-song re-upload that is a VERSION (sped-up "Fast", remix,
   // nightcore…) covers every title word and ties with the plain song at
