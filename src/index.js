@@ -518,7 +518,18 @@ process.on('unhandledRejection', (err) => console.error('Unhandled:', err));
 // (Free services sleep without HTTP traffic — see README.)
 // Default 7860 suits Hugging Face Spaces Docker; hosts like Render/Koyeb set PORT.
 const PORT = process.env.PORT || 7860;
-http.createServer((req, res) => {
+import { probePlayback } from './player.js';
+
+let probePromise = null;
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+  if (url.pathname === '/probe' && process.env.PROBE_KEY && url.searchParams.get('k') === process.env.PROBE_KEY) {
+    if (!probePromise) probePromise = probePlayback().catch((e) => ({ error: String(e?.message || e) }));
+    const result = await probePromise;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result, null, 2));
+    return;
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Swamp Tunes is swimming 🐊');
 }).listen(PORT, () => console.log(`🌐 Health check listening on port ${PORT}`));
