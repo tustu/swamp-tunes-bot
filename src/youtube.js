@@ -261,18 +261,31 @@ export async function resolveAnyQuery(query) {
 
 export async function findOnYouTube(title, artist) {
   const q = `${title} ${artist || ''}`.trim();
-  const { stdout } = await ytMeta([
-    '--no-playlist',
-    '--skip-download',
-    '--print',
-    PRINT,
-    `ytsearch1:${q}`,
-  ]);
+  // Door 1 — yt-dlp's own YouTube search (one attempt, no 429 backoff:
+  // on a walled host the retries only burn the caller's time, and the
+  // side doors below answer faster).
   try {
+    const { stdout } = await yt([
+      '--no-playlist',
+      '--skip-download',
+      '--print',
+      PRINT,
+      `ytsearch1:${q}`,
+    ], { timeout: 15_000 });
     return searchFirstLine(stdout);
-  } catch {
-    throw new Error(`No YouTube match for "${q}"`);
-  }
+  } catch { /* fall through to the side doors */ }
+  // Door 2 — the same YouTube catalog through an Invidious instance.
+  const viaInv = await searchOnInvidious(q).catch(() => []);
+  if (viaInv.length) return viaInv[0];
+  // Door 3 — a SoundCloud track for the same song. The returned track
+  // is SoundCloud-shaped, so the playback cascade plays it from its
+  // own page first and its multi-candidate search after that — the
+  // song still lands even when every YouTube door is walled.
+  const viaApi = await searchOnSoundCloudApi(title, artist || '', { timeoutMs: 6_000 }).catch(() => []);
+  if (viaApi.length) return viaApi[0];
+  const viaSc = await searchOnSoundCloud(title, artist || '', { timeoutMs: 10_000, retry: false }).catch(() => []);
+  if (viaSc.length) return viaSc[0];
+  throw new Error(`No match for "${q}" on YouTube, Invidious or SoundCloud`);
 }
 
 /** Strip the decorations YouTube titles carry, for search queries. */
@@ -313,10 +326,12 @@ export function searchOnYouTube(title, artist, opts = {}) {
   return searchTracks('ytsearch', q, 5, opts.timeoutMs, opts.retry !== false);
 }
 
-/** Up to 5 SoundCloud search results for a { title, artist } pair. */
+/** Up to 5 SoundCloud search results for a { title, artist } pair
+ *  (opts.n widens the pool — the playback cascade asks for 10, because
+ *  its job is to survive several locked/dead uploads of the same song). */
 export function searchOnSoundCloud(title, artist, opts = {}) {
   const q = `${cleanTitleForSearch(title) || title} ${artist || ''}`.trim();
-  return searchTracks('scsearch', q, 5, opts.timeoutMs, opts.retry !== false);
+  return searchTracks('scsearch', q, opts.n || 5, opts.timeoutMs, opts.retry !== false);
 }
 
 /**
@@ -484,6 +499,70 @@ export async function streamUrlFor(videoId, pageUrl, opts = {}) {
       return best.url;
     }
     throw lastErr || new Error('Could not get an audio stream.');
+  }, priority);
+}
+
+/**
+ * YouTube extraction through MULTI-CLIENT extractor-arg sets — a
+ * different attempt shape from streamUrlFor's one-client-at-a-time
+ * rotation. Passing several player clients in one extractor-args call
+ * lets yt-dlp merge the client responses, and some sets slip a wall
+ * that stops every single client (the TV / embedded clients are the
+ * least challenged classes). Each set gets ONE attempt, quality-first
+ * like streamUrlFor: a proper audio-only stream at a good bitrate is
+ * accepted on the spot; otherwise the best result across the sets wins.
+ *
+ * Honest expectations: from a datacenter IP with an active bot wall
+ * ("Sign in to confirm you're not a bot"), EVERY set can still fail —
+ * no client rotation defeats a cookie gate, and none is promised to.
+ * This tier exists so the cascade tries genuinely different YouTube
+ * doors before giving the song to Invidious / play-dl; SoundCloud's
+ * multi-candidate search, not this, is the workhorse on a walled host.
+ */
+const YT_CLIENT_SETS = [
+  'tv,android_vr,web_embedded',
+  'android_vr,tv_embedded,ios',
+  'web_embedded,web_music,android_vr',
+];
+
+export async function streamUrlViaClientSets(videoId, opts = {}) {
+  const target = `https://www.youtube.com/watch?v=${videoId}`;
+  const priority = opts.priority || 'high';
+  const attemptMs = opts.attemptMs || 8_000;
+  const deadline = opts.deadline || null;
+  const attemptTimeout = () => {
+    const cap = deadline ? deadline - Date.now() : attemptMs;
+    return Math.max(1_500, Math.min(attemptMs, cap));
+  };
+  return withStreamLock(async () => {
+    let best = null;
+    let lastErr = null;
+    for (const set of YT_CLIENT_SETS) {
+      if (deadline && Date.now() >= deadline) {
+        lastErr = lastErr || new Error('Stream lookup ran out of time');
+        break;
+      }
+      let s;
+      try {
+        s = await extractStream(target, [
+          '--extractor-args', `youtube:player_client=${set}`,
+        ], attemptTimeout());
+      } catch (err) {
+        lastErr = err;
+        continue;
+      }
+      const candidate = { ...s, set };
+      if (candidate.audioOnly && (candidate.abr === null || candidate.abr >= 96)) {
+        console.log(`[Swamp Tunes] stream extracted via youtube client set "${set}" (${describeStream(candidate)})`);
+        return candidate.url;
+      }
+      if (!best || streamBeats(candidate, best)) best = candidate;
+    }
+    if (best) {
+      console.log(`[Swamp Tunes] stream extracted via youtube client set "${best.set}" (${describeStream(best)})`);
+      return best.url;
+    }
+    throw lastErr || new Error('Could not get an audio stream from any client set.');
   }, priority);
 }
 
@@ -678,6 +757,41 @@ export async function resolvePlaylistTracks(query) {
     : resolveSoundCloudSet(info.url);
 }
 
+/** Read a YouTube playlist through a public Invidious instance's API.
+ *  Returns track-shaped entries (same shape as the yt-dlp path); []
+ *  when no tried instance can serve it. */
+async function resolveYouTubePlaylistViaInvidious(listId) {
+  const hosts = await invidiousHosts();
+  for (const host of hosts.slice(0, 3)) {
+    try {
+      const res = await fetch(
+        `https://${host}/api/v1/playlists/${encodeURIComponent(listId)}?fields=videos`,
+        { signal: AbortSignal.timeout(10_000) },
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      const tracks = (Array.isArray(data?.videos) ? data.videos : [])
+        .filter((v) => v && v.videoId && v.title)
+        .slice(0, PLAYLIST_CAP)
+        .map((v) => {
+          const track = {
+            id: v.videoId,
+            title: String(v.title).replace(/\s+/g, ' ').trim(),
+            duration: Number(v.lengthSeconds) || 0,
+            url: `https://www.youtube.com/watch?v=${v.videoId}`,
+          };
+          if (v.author) track.uploader = String(v.author).replace(/\s+/g, ' ').trim();
+          const thumbs = Array.isArray(v.videoThumbnails) ? v.videoThumbnails : [];
+          const thumb = thumbs.find((t) => t.quality === 'maxres') || thumbs[0];
+          if (thumb?.url) track.thumbnail = thumb.url.startsWith('http') ? thumb.url : `https://${host}${thumb.url}`;
+          return track;
+        });
+      if (tracks.length) return tracks;
+    } catch { /* try the next instance */ }
+  }
+  return [];
+}
+
 async function resolveYouTubePlaylist(listId) {
   let data;
   try {
@@ -692,6 +806,15 @@ async function resolveYouTubePlaylist(listId) {
     ], { timeout: 90_000 });
     data = JSON.parse(stdout);
   } catch {
+    data = null;
+  }
+  if (!data?.entries?.length) {
+    // The yt-dlp read is itself bot-walled from datacenter IPs on some
+    // days — read the same playlist through an Invidious instance's
+    // API before declaring the link dead. The tracks come back in the
+    // same shape and play through the normal cascade.
+    const viaInv = await resolveYouTubePlaylistViaInvidious(listId).catch(() => []);
+    if (viaInv.length) return viaInv;
     throw new Error('Could not read that YouTube playlist (it may be private or unavailable).');
   }
   const tracks = (data.entries || [])
