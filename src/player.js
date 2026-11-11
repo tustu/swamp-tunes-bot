@@ -12,7 +12,7 @@ import {
 import { EmbedBuilder } from 'discord.js';
 import playDl from 'play-dl';
 import ffmpegStatic from 'ffmpeg-static';
-import { streamUrlFor, streamUrlViaClientSets, youtubeVideoId, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, invidiousStreamFor, resolveTextQuery, errReason, formatDuration } from './youtube.js';
+import { streamUrlFor, streamUrlViaClientSets, youtubeVideoId, searchOnSoundCloud, searchOnSoundCloudApi, searchOnYouTube, searchOnInvidious, invidiousStreamFor, resolveTextQuery, errReason, formatDuration } from './youtube.js';
 import { applyTheme } from './themes.js';
 
 // ffmpeg choice: the host's own ffmpeg FIRST (the Dockerfile installs
@@ -415,40 +415,58 @@ function rankedMatches(requested, candidates) {
 }
 
 /**
- * The playback cascade: find ONE reachable stream for the exact song,
+ * The playback race (v3): find ONE reachable stream for the exact song,
  * within the budget, and PROVE it flows before handing it to the voice
  * layer. Proven in production (Nov 2026): from the host's datacenter
- * IP, YouTube refuses every player client (webpage 429, API 403,
+ * IP, YouTube refuses most player clients (webpage 429, API 403,
  * "Sign in to confirm you're not a bot"), while SoundCloud serves the
- * same catalog fine — so sources are tried in this order:
+ * same catalog fine — and some songs exist on NEITHER side in a
+ * reachable copy, so every door has to be tried while time remains.
  *
- * 1. SOUNDCLOUD OWN PAGE — a SoundCloud track plays from its own page,
- *    byte-verified through the bot's own ffmpeg (the probe approach).
- * 2. SOUNDCLOUD MULTI-CANDIDATE — the workhorse. Candidates from BOTH
- *    SoundCloud doors (the api-v2 search AND the yt-dlp search, merged
- *    and deduped), gated by isSameSong, best match first, up to 8
- *    tried, each extracted AND byte-verified. This tier exists because
- *    of Nov 10: the old cascade's pool came from the API alone, the
- *    strict gate left exactly ONE candidate, that upload was
- *    SAMPLE-AES DRM, and the song died in 24 seconds with every other
- *    door untried. One locked upload must never end the attempt.
- * 3. YOUTUBE CLIENT-SET VARIANTS — yt-dlp with multi-client
- *    extractor-arg sets (tv/android_vr/web_embedded, …). Honest note:
- *    against an active bot wall these can ALL still fail — no client
- *    rotation defeats a cookie gate. Tried because they are genuinely
- *    different doors, verified like everything else.
- * 4. YOUTUBE SINGLE-CLIENT ROTATION — the older streamUrlFor path.
- * 5. INVIDIOUS — the same video through another front-end's network
- *    (it byte-verifies its own stream before returning it).
- * 6. PLAY-DL — last of the direct routes.
- * 7. GATED RE-SEARCH — a different upload of the same song, through
- *    the YouTube doors and then Invidious.
+ * v2 ran the doors as a SERIAL cascade (SoundCloud, then YouTube, then
+ * Invidious, then play-dl, then re-search), and its own post-mortem
+ * named the flaw: slow failing doors burned the whole 40s budget
+ * before the late tiers ever ran — "LARRY FORD" died at 22:22:49 on
+ * Nov 10 with Invidious and play-dl barely touched. v3 therefore runs
+ * the source families CONCURRENTLY and takes the first stream that
+ * passes byte-verification; the losers are abandoned mid-flight (each
+ * lane checks the race state between attempts and stops spending).
+ * The lanes:
  *
- * A failure at any tier — or any single candidate — falls through to
- * the next; nothing ends the attempt early. Every attempt logs exactly
- * one line with its outcome — no silent catches anywhere in this path.
- * The queue entry, title and now-playing flow never change; only the
- * host behind the song does.
+ * - SOUNDCLOUD — a linked SoundCloud track from its own page first,
+ *   then the deep multi-candidate pool: api-v2 searches under several
+ *   query formulations (title+artist, title only, feat-stripped core
+ *   title, "official audio") merged and deduped, topped up by yt-dlp
+ *   scsearch (n=15) when the same-song gate leaves the pool thin.
+ *   Gated candidates are tried best-first, up to 12 at play time,
+ *   each extracted AND byte-verified. One locked upload (SAMPLE-AES
+ *   DRM officials are common) never ends the attempt.
+ * - YOUTUBE — the track's own video through the multi-client sets,
+ *   then the single-client rotation; then up to 3 OTHER gated uploads
+ *   of the same song through the client sets. Honest note: against an
+ *   active bot wall every set can still fail — no client rotation
+ *   defeats a cookie gate. Production also proved the sets DO extract
+ *   real streams (fmt 18) on this host, so the door is worth racing.
+ * - INVIDIOUS — the same video ids (own + the other uploads) through
+ *   public instances; it byte-verifies its own stream before
+ *   returning, and answers from the instance's network, not ours.
+ * - PLAY-DL — opens the stream itself; from most networks it answers
+ *   429, but where it answers it is a door nothing else duplicates.
+ *
+ * The one serialization left is deliberate: yt-dlp stream EXTRACTIONS
+ * still pass through the two-lane stream lock in youtube.js, because
+ * parallel -g lookups from one IP are what trips YouTube's 429 wall.
+ * Everything else — searches, Invidious lookups, verifications — runs
+ * in parallel, so a typical song is resolved by its FASTEST door
+ * instead of paying every slow door's timeout in sequence.
+ *
+ * A failure at any door — or any single candidate — never ends the
+ * attempt; only the shared deadline or a verified stream does. Every
+ * attempt logs exactly one line with its outcome — no silent catches
+ * anywhere in this path. The same-song gate is unchanged: the exact
+ * song or nothing, never a different artist's namesake. The queue
+ * entry, title and now-playing flow never change; only the host
+ * behind the song does.
  */
 /** Below this many decoded bytes in the probe window, a stream is a
  *  dead door, not a quiet song: real audio through this ffmpeg stage
@@ -495,6 +513,49 @@ function cleanSongQuery(title) {
     .trim();
 }
 
+
+/**
+ * The plain-song core of a decorated title: feat./ft./featuring credits
+ * stripped, whether they trail the title ("Song feat. X"), sit in
+ * brackets ("Song (feat. X)"), or ride mid-title. SoundCloud's pool for
+ * the decorated form is often just the locked official upload, while
+ * re-uploads carry the plain title — the cascade searches both shapes.
+ */
+function scCoreTitle(title) {
+  const core = String(title || '')
+    .replace(/\((?:feat\.?|ft\.?|featuring)[^)]*\)/gi, ' ')
+    .replace(/\[(?:feat\.?|ft\.?|featuring)[^\]]*\]/gi, ' ')
+    .replace(/\s+(?:feat\.?|ft\.?|featuring)\s+.+$/i, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return core || String(title || '').trim();
+}
+
+/**
+ * The SoundCloud api-v2 query formulations for one song, deduped:
+ * as-is with the artist, title alone, the feat-stripped core both
+ * ways, and the "official audio" variant. The API answers each in
+ * about a second, so the race fires them all at once and merges the
+ * pools — five cheap questions beat one perfect question when the
+ * pool's ranking changes with every phrasing.
+ */
+function scQueryFormulations(title, artist) {
+  const core = scCoreTitle(title);
+  const forms = [];
+  const seen = new Set();
+  const add = (t, a, label) => {
+    const key = `${t}||${a || ''}`;
+    if (!t || seen.has(key)) return;
+    seen.add(key);
+    forms.push({ title: t, artist: a || '', label });
+  };
+  add(title, artist, 'title+artist');
+  add(title, '', 'title only');
+  add(core, artist, 'core title+artist');
+  add(core, '', 'core title only');
+  add(`${core} official audio`, artist, 'official audio');
+  return forms;
+}
 export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, priority = 'high' } = {}) {
   const deadline = Date.now() + budgetMs;
   const remaining = () => deadline - Date.now();
@@ -525,60 +586,108 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
     throw new Error(`stream delivered only ${bytes} bytes in ${ms}ms (dead door)`);
   };
 
-  const trySoundCloudSearch = async (excludeId) => {
-    // MERGED pool: the api-v2 search (fast, artist-first ranking) AND
-    // the yt-dlp scsearch (different ranking, different misses), always
-    // both, deduped by track id. The old shape only consulted yt-dlp
-    // when the API returned nothing at all — so a thin API pool, cut
-    // down further by the same-song gate, could leave a single
-    // candidate standing between the song and silence (Nov 10).
+  // Race state: the first lane to hand back a verified source wins;
+  // every other lane sees raceWon flip and stops spending between
+  // attempts. alive() is also the deadline check — a lane with less
+  // than a second of budget left has nothing left to start.
+  let raceWon = false;
+  const alive = () => !raceWon && remaining() > 900;
+
+  // Shared discovery for the YouTube and Invidious lanes: OTHER uploads
+  // of the same song — up to 3 distinct video ids, same-song gated,
+  // best match first. Both search doors run at once (yt-dlp's search
+  // and an Invidious instance's, whose network YouTube doesn't wall),
+  // merged and deduped. Best-effort: any failure just leaves the lanes
+  // with the track's own video id.
+  const uploadsPromise = (async () => {
+    try {
+      const [ytRes, invRes] = await Promise.allSettled([
+        searchOnYouTube(searchTitle, artist, {
+          timeoutMs: Math.min(12_000, Math.max(2_000, remaining())),
+          retry: false,
+        }),
+        searchOnInvidious(`${searchTitle} ${artist}`.trim(), { timeoutMs: 8_000 }),
+      ]);
+      if (ytRes.status === 'rejected') noteFail('youtube re-search', ytRes.reason);
+      const byId = new Map();
+      for (const r of [ytRes, invRes]) {
+        if (r.status !== 'fulfilled') continue;
+        for (const c of r.value || []) {
+          if (c && c.id && !byId.has(String(c.id))) byId.set(String(c.id), c);
+        }
+      }
+      const ranked = rankedMatches(track, [...byId.values()])
+        .filter((c) => String(c.id) !== String(ytId ?? '') && String(c.id) !== String(track.id ?? ''));
+      if (!ranked.length) {
+        console.log(`[${BOT_NAME}] race: no other upload of "${track.title}" found for the YouTube lanes`);
+      }
+      return ranked.slice(0, 3);
+    } catch { return []; }
+  })();
+
+  // Lane 1 — SoundCloud. A linked SoundCloud track plays from its own
+  // page first; then the deep multi-candidate pool. The pool merges
+  // api-v2 searches under every query formulation (fired at once),
+  // topped up by yt-dlp scsearch (n=15) when the same-song gate leaves
+  // it thin. Candidates are gated, best first, up to 12 tried at play
+  // priority — one locked or dead upload never ends the attempt.
+  const laneSoundCloud = async () => {
+    if (isSCTrack) {
+      try {
+        const url = await streamUrlFor(track.id, track.url, { priority, deadline });
+        const ok = await verified(url, `soundcloud own page "${track.title}"`);
+        console.log(`[${BOT_NAME}] soundcloud: playing "${track.title}" from its own page`);
+        return ok;
+      } catch (err) { noteFail('soundcloud', err); }
+    }
     const byId = new Map();
     const addAll = (list) => {
       for (const c of list || []) {
         if (c && c.id && !byId.has(String(c.id))) byId.set(String(c.id), c);
       }
     };
-    try {
-      addAll(await searchOnSoundCloudApi(searchTitle, artist, {
-        timeoutMs: Math.min(8_000, Math.max(1_000, remaining())),
-      }));
-    } catch (err) { noteFail('soundcloud api search', err); }
-    // Title-only API search too: appending a YouTube channel name
-    // ("LilBabyVEVO") as the "artist" poisons SoundCloud's ranking,
-    // while fan re-uploads are titled with the artist's real name —
-    // "Lil Baby - Life Of The Party" finds copies that the
-    // channel-name query never surfaces.
-    if (artist && remaining() > 3_000) {
-      try {
-        addAll(await searchOnSoundCloudApi(searchTitle, '', {
-          timeoutMs: Math.min(6_000, Math.max(1_000, remaining())),
-        }));
-      } catch (err) { noteFail('soundcloud api search (title only)', err); }
-    }
+    const ownId = isSCTrack ? String(track.id ?? '') : null;
+    const gatePool = () => rankedMatches(track, [...byId.values()])
+      .filter((c) => String(c.id) !== ownId);
+    const forms = scQueryFormulations(searchTitle, artist);
+    const formResults = await Promise.allSettled(forms.map((f) => searchOnSoundCloudApi(
+      f.title,
+      f.artist,
+      { timeoutMs: Math.min(6_000, Math.max(1_500, remaining())) },
+    )));
+    formResults.forEach((r, i) => {
+      if (r.status === 'fulfilled') addAll(r.value);
+      else noteFail(`soundcloud api search (${forms[i].label})`, r.reason);
+    });
+    let ranked = gatePool();
+    console.log(`[${BOT_NAME}] soundcloud: pool of ${byId.size} across ${forms.length} searches, ${ranked.length} same-song for "${track.title}"`);
     // The yt-dlp scsearch is the slow door (~10s): only pay for it
     // when the API pools left the same-song gate nearly empty.
-    let ranked = rankedMatches(track, [...byId.values()])
-      .filter((c) => String(c.id) !== String(excludeId ?? ''));
-    if (ranked.length < 3 && remaining() > 12_000) {
+    const deepen = async (label, t, a) => {
       try {
-        addAll(await searchOnSoundCloud(searchTitle, artist, {
-          timeoutMs: Math.min(10_000, remaining()),
+        addAll(await searchOnSoundCloud(t, a, {
+          timeoutMs: Math.min(12_000, Math.max(2_000, remaining())),
           retry: false,
-          n: 10,
+          n: 15,
         }));
-      } catch (err) { noteFail('soundcloud search', err); }
-      ranked = rankedMatches(track, [...byId.values()])
-        .filter((c) => String(c.id) !== String(excludeId ?? ''));
+      } catch (err) { noteFail(label, err); }
+      ranked = gatePool();
+    };
+    if (ranked.length < 4 && alive() && remaining() > 10_000) {
+      await deepen('soundcloud search', searchTitle, artist);
+    }
+    if (ranked.length < 4 && alive() && remaining() > 10_000) {
+      await deepen('soundcloud search (core title)', scCoreTitle(searchTitle), artist);
     }
     if (!ranked.length) {
       console.log(`[${BOT_NAME}] soundcloud: no exact-song match for "${track.title}"`);
       return null;
     }
-    const cap = priority === 'low' ? 5 : 8;
+    const cap = priority === 'low' ? 6 : 12;
     console.log(`[${BOT_NAME}] soundcloud: ${ranked.length} same-song candidate(s) for "${track.title}" — trying until one flows`);
     let tried = 0;
     for (const cand of ranked.slice(0, cap)) {
-      if (remaining() <= 2_500) break;
+      if (!alive()) break;
       tried += 1;
       try {
         const url = await streamUrlFor(cand.id, cand.url, { priority, deadline });
@@ -590,113 +699,92 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
     return null;
   };
 
-  // Tier 1 — a SoundCloud track from its own page, byte-verified.
-  // A direct SoundCloud link that fails here falls straight into the
-  // multi-candidate search on its title (Tier 2) — the linked upload
-  // being locked never ends the attempt.
-  if (isSCTrack) {
-    try {
-      const url = await streamUrlFor(track.id, track.url, { priority, deadline });
-      const ok = await verified(url, `soundcloud own page "${track.title}"`);
-      console.log(`[${BOT_NAME}] soundcloud: playing "${track.title}" from its own page`);
-      return ok;
-    } catch (err) { noteFail('soundcloud', err); }
-  }
+  // Lane 2 — YouTube. The track's own video first: multi-client sets,
+  // then the single-client rotation (v2's tiers 3-4, now one lane).
+  // Then up to 3 other gated uploads of the same song, each through
+  // the client sets (v2's tier 7, promoted into the race).
+  const laneYouTube = async () => {
+    const ids = [];
+    if (ytId) ids.push({ id: ytId, own: true, title: track.title });
+    for (const c of await uploadsPromise) ids.push({ id: c.id, own: false, title: c.title });
+    for (const entry of ids) {
+      if (!alive()) break;
+      try {
+        const url = await streamUrlViaClientSets(entry.id, { priority, deadline });
+        const ok = await verified(url, `youtube client sets "${entry.title}"`);
+        console.log(entry.own
+          ? `[${BOT_NAME}] youtube: playing "${track.title}" via client-set rotation`
+          : `[${BOT_NAME}] youtube: playing another upload of "${track.title}" ("${entry.title}") via client sets`);
+        return ok;
+      } catch (err) { noteFail(entry.own ? 'youtube client sets' : `youtube candidate "${entry.title}"`, err); }
+      if (entry.own) {
+        if (!alive()) break;
+        try {
+          const url = await streamUrlFor(entry.id, track.url, { priority, deadline });
+          const ok = await verified(url, `youtube rotation "${track.title}"`);
+          console.log(`[${BOT_NAME}] youtube: playing "${track.title}" via client rotation`);
+          return ok;
+        } catch (err) { noteFail('youtube', err); }
+      }
+    }
+    return null;
+  };
 
-  // Tier 2 — SoundCloud multi-candidate (the workhorse), for every
-  // track shape: a linked SoundCloud track that just failed, a YouTube
-  // video, or a title resolved from a Spotify / Apple Music / Deezer
-  // link. One locked or dead upload never ends the attempt.
-  const viaSC = await trySoundCloudSearch(isSCTrack ? track.id : null);
-  if (viaSC) return viaSC;
+  // Lane 3 — Invidious: the same video ids (own first, then the other
+  // uploads) through public instances. This door answers from the
+  // instance's network and byte-verifies its own stream before
+  // returning it (inside invidiousStreamFor).
+  const laneInvidious = async () => {
+    const ids = [];
+    if (ytId) ids.push(ytId);
+    for (const c of await uploadsPromise) ids.push(c.id);
+    for (const id of ids) {
+      if (!alive()) break;
+      try {
+        const s = await invidiousStreamFor(id, { deadline });
+        console.log(`[${BOT_NAME}] invidious: playing "${track.title}" via ${s.host} (${s.format})`);
+        return s.url;
+      } catch (err) { noteFail('invidious', err); }
+    }
+    return null;
+  };
 
-  // Tier 3 — YouTube client-set variants on the track's own video:
-  // yt-dlp with multi-client extractor-arg sets. A different attempt
-  // shape from the rotation below, with the same honest caveat — an
-  // active bot wall can stop every set (see streamUrlViaClientSets).
-  // Byte-verified like every other extracted URL.
-  if (ytId && remaining() > 1_000) {
-    try {
-      const url = await streamUrlViaClientSets(ytId, { priority, deadline });
-      const ok = await verified(url, `youtube client sets "${track.title}"`);
-      console.log(`[${BOT_NAME}] youtube: playing "${track.title}" via client-set rotation`);
-      return ok;
-    } catch (err) { noteFail('youtube client sets', err); }
-  }
-
-  // Tier 4 — YouTube single-client rotation on the track's own video
-  // (the older streamUrlFor path), byte-verified.
-  if (ytId && remaining() > 1_000) {
-    try {
-      const url = await streamUrlFor(ytId, track.url, { priority, deadline });
-      const ok = await verified(url, `youtube rotation "${track.title}"`);
-      console.log(`[${BOT_NAME}] youtube: playing "${track.title}" via client rotation`);
-      return ok;
-    } catch (err) { noteFail('youtube', err); }
-  }
-
-  // Tier 5 — Invidious: the same video through another front-end.
-  // This door answers from the instance's network, and it byte-
-  // verifies its own stream before returning it.
-  if (ytId && remaining() > 1_000) {
-    try {
-      const s = await invidiousStreamFor(ytId, { deadline });
-      console.log(`[${BOT_NAME}] invidious: playing "${track.title}" via ${s.host} (${s.format})`);
-      return s.url;
-    } catch (err) { noteFail('invidious', err); }
-  }
-
-  // Tier 6 — play-dl, last of the direct routes: opens the stream
-  // itself instead of asking yt-dlp to extract one. From every network
-  // tested on Nov 9 it answered 429 and only added its timeout to the
-  // cascade; it stays in the chain because on a network where it does
-  // answer, it is a door nothing else duplicates. Returns a live
-  // stream object, not a URL; callers route it through the same
-  // ffmpeg stage as every source.
-  if (!isSCTrack && track.url && remaining() > 1_000) {
+  // Lane 4 — play-dl, which opens the stream itself instead of asking
+  // yt-dlp to extract one. From every network tested on Nov 9 it
+  // answered 429 and only added its timeout; it stays because on a
+  // network where it does answer, it is a door nothing else
+  // duplicates. Returns a live stream object, not a URL; callers
+  // route it through the same ffmpeg stage as every source.
+  const lanePlayDl = async () => {
+    if (isSCTrack || !track.url) return null;
     try {
       const info = await withStreamTimeout(
         playDl.stream(track.url),
-        Math.min(6_000, remaining()),
+        Math.min(6_000, Math.max(1_000, remaining())),
         'play-dl',
       );
       console.log(`[${BOT_NAME}] play-dl: playing "${track.title}"`);
       return { playDl: info };
-    } catch (err) { noteFail('play-dl', err); }
-  }
+    } catch (err) { noteFail('play-dl', err); return null; }
+  };
 
-  // Tier 7 — gated re-search: another upload of the same song, through
-  // the YouTube doors (byte-verified) and then Invidious. Also the
-  // only YouTube route for a SoundCloud-native track whose own page
-  // and search both failed.
-  if (remaining() > 3_000) {
-    let candidates = [];
-    try {
-      candidates = await searchOnYouTube(searchTitle, artist, {
-        timeoutMs: Math.min(15_000, remaining()),
-        retry: false,
-      });
-    } catch (err) { noteFail('youtube re-search', err); }
-    const ranked = rankedMatches(track, candidates).filter((c) => String(c.id) !== String(track.id ?? ''));
-    if (!ranked.length) {
-      console.log(`[${BOT_NAME}] youtube re-search: no other upload of "${track.title}"`);
+  const lanes = [laneSoundCloud(), laneYouTube(), laneInvidious(), lanePlayDl()];
+  console.log(`[${BOT_NAME}] race: ${lanes.length} doors in parallel for "${track.title}" — first verified stream wins`);
+  const winner = await new Promise((resolve) => {
+    let pending = lanes.length;
+    let done = false;
+    for (const p of lanes) {
+      Promise.resolve(p).then(
+        (v) => {
+          if (done) return;
+          if (v != null) { done = true; raceWon = true; resolve(v); }
+          else if (--pending === 0) resolve(null);
+        },
+        () => { if (!done && --pending === 0) resolve(null); },
+      );
     }
-    for (const cand of ranked.slice(0, 2)) {
-      if (remaining() <= 1_000) break;
-      try {
-        const url = await streamUrlViaClientSets(cand.id, { priority, deadline });
-        const ok = await verified(url, `youtube candidate "${cand.title}"`);
-        console.log(`[${BOT_NAME}] youtube re-search: playing another upload of "${track.title}" ("${cand.title}")`);
-        return ok;
-      } catch (err) { noteFail(`youtube candidate "${cand.title}"`, err); }
-      if (remaining() <= 1_000) break;
-      try {
-        const s = await invidiousStreamFor(cand.id, { deadline });
-        console.log(`[${BOT_NAME}] invidious: playing "${cand.title}" via ${s.host} (${s.format}) for "${track.title}"`);
-        return s.url;
-      } catch (err) { noteFail(`invidious candidate "${cand.title}"`, err); }
-    }
-  }
+  });
+  if (winner) return winner;
 
   throw lastErr || new Error(`No reachable source for "${track.title}"`);
 }
