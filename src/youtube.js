@@ -573,16 +573,23 @@ export async function streamUrlViaClientSets(videoId, opts = {}) {
 // directly can still play, bit-for-bit the same upload. The instance
 // pool is small and churns, so hosts are discovered at runtime from the
 // official instance list (only instances that report their API enabled),
-// cached for an hour, with the last instance verified live (Nov 2026) as
-// the seed. At most 2 instances are tried per lookup, on tight timeouts.
+// cached for an hour and appended AFTER this seed — the seed order is
+// the working priority list. Refreshed for v3 (Nov 10): the old seed's
+// front four were all dead doors in production that night
+// (yt.chocolatemoo53.com resolved but delivered no data; inv.nadeko.net
+// and yewtu.be answered 403; invidious.jing.rocks didn't answer at all),
+// so they are gone. The new front pair answered the API live the same
+// night; the rest are the longest-lived public instances. At most 2
+// instances are tried per search lookup, 4 per stream lookup, on tight
+// timeouts.
 const INVIDIOUS_SEED = [
-  'yt.chocolatemoo53.com',
-  'inv.nadeko.net',
-  'yewtu.be',
-  'invidious.jing.rocks',
-  'iv.datura.network',
   'invidious.nerdvpn.de',
+  'invidious.protokolla.fi',
+  'iv.datura.network',
   'inv.us.projectsegfau.lt',
+  'invidious.privacyredirect.com',
+  'invidious.0011.lt',
+  'inv.tux.pizza',
 ];
 let invidiousCache = { at: 0, hosts: INVIDIOUS_SEED };
 
