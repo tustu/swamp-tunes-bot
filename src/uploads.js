@@ -1,5 +1,5 @@
 // Local file uploads for Swamp Tunes.
-// A permitted user drops a small .mp3 / .wav into a text channel and the
+// A permitted user drops a small .mp3 / .wav / .mp4 into a text channel and the
 // bot downloads it to a temp file and queues it like any other track.
 // The player deletes the temp file when the track leaves rotation.
 import { execFile } from 'node:child_process';
@@ -13,9 +13,9 @@ import { PermissionFlagsBits } from 'discord.js';
 const execFileAsync = promisify(execFile);
 
 export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
-export const PLAYABLE_EXTS = ['.mp3', '.wav'];
+export const PLAYABLE_EXTS = ['.mp3', '.wav', '.mp4'];
 // Audio-ish but unsupported: worth one short note to a permitted user.
-export const UNSUPPORTED_AUDIO_EXTS = ['.flac', '.ogg', '.oga', '.m4a', '.aac', '.opus', '.wma', '.aiff', '.aif', '.webm', '.mp4', '.mov', '.mid', '.midi'];
+export const UNSUPPORTED_AUDIO_EXTS = ['.flac', '.ogg', '.oga', '.m4a', '.aac', '.opus', '.wma', '.aiff', '.aif', '.webm', '.mov', '.mid', '.midi'];
 
 export function djRoleName() {
   return process.env.DJ_ROLE_NAME || 'Swamp DJ';
