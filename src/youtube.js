@@ -254,9 +254,28 @@ export async function resolveYouTubeUrl(url) {
 export async function resolveAnyQuery(query) {
   const q = String(query).trim();
   if (/^https?:\/\//i.test(q)) {
+    // A direct link to a media file (the user's own .mp4/.mp3/.wav, a
+    // Discord CDN attachment link, any host serving the file itself):
+    // queue it as-is. The player byte-verifies the URL through ffmpeg
+    // and plays the audio track (-vn drops any video). Sending these
+    // through yt-dlp metadata + the song-search lanes queued them and
+    // then failed every lane — the bot never joined voice (Nov 26).
+    const direct = directMediaTrack(q);
+    if (direct) return direct;
     return youtubeVideoId(q) ? resolveYouTubeUrl(q) : resolveTrack(q);
   }
   return resolveTextQuery(q);
+}
+
+const DIRECT_MEDIA_EXTS = ['.mp4', '.mp3', '.wav'];
+function directMediaTrack(q) {
+  let u;
+  try { u = new URL(q); } catch { return null; }
+  const path = u.pathname.toLowerCase();
+  if (!DIRECT_MEDIA_EXTS.some((e) => path.endsWith(e))) return null;
+  const base = decodeURIComponent(path.split('/').pop() || 'track');
+  const title = base.replace(/\.(mp4|mp3|wav)$/i, '').replace(/[_-]+/g, ' ').trim() || 'track';
+  return { id: q, title, duration: 0, url: q };
 }
 
 export async function findOnYouTube(title, artist) {
@@ -582,14 +601,12 @@ export async function streamUrlViaClientSets(videoId, opts = {}) {
 // night; the rest are the longest-lived public instances. At most 2
 // instances are tried per search lookup, 4 per stream lookup, on tight
 // timeouts.
+// Trimmed Nov 26: only the front pair still answered the API when
+// probed; the other five were dead doors burning lookup time. Runtime
+// discovery from api.invidious.io still appends live instances hourly.
 const INVIDIOUS_SEED = [
   'invidious.nerdvpn.de',
   'invidious.protokolla.fi',
-  'iv.datura.network',
-  'inv.us.projectsegfau.lt',
-  'invidious.privacyredirect.com',
-  'invidious.0011.lt',
-  'inv.tux.pizza',
 ];
 let invidiousCache = { at: 0, hosts: INVIDIOUS_SEED };
 
