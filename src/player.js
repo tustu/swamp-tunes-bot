@@ -586,6 +586,26 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
     throw new Error(`stream delivered only ${bytes} bytes in ${ms}ms (dead door)`);
   };
 
+  // Lane 0 — direct media link: the track URL IS the media file (the
+  // user's own .mp4/.mp3/.wav link, a Discord CDN attachment, any host
+  // serving the file). No search lane can play these — SoundCloud and
+  // YouTube search by title, play-dl rejects generic URLs — so queued
+  // direct links failed every lane and the bot never joined voice
+  // (Nov 26). Byte-verify the URL itself through ffmpeg; -vn in
+  // createResource drops any video track. Falls through to the race
+  // if the direct URL delivers nothing.
+  if (/^https?:\/\//i.test(track.url || '')) {
+    let directPath = '';
+    try { directPath = new URL(track.url).pathname.toLowerCase(); } catch { /* not a URL */ }
+    if (/\.(mp4|mp3|wav)$/.test(directPath)) {
+      try {
+        const ok = await verified(track.url, `direct media "${track.title}"`);
+        console.log(`[${BOT_NAME}] direct: playing "${track.title}" from its own link`);
+        return ok;
+      } catch (err) { noteFail('direct media', err); }
+    }
+  }
+
   // Race state: the first lane to hand back a verified source wins;
   // every other lane sees raceWon flip and stops spending between
   // attempts. alive() is also the deadline check — a lane with less
