@@ -129,7 +129,9 @@ export async function resolveTrack(query) {
   const q = query.trim();
   if (/^https?:\/\//i.test(q)) {
     const { stdout } = await ytMeta(['--no-playlist', '--skip-download', '--print', PRINT, q]);
-    return searchFirstLine(stdout);
+    // Metadata for the exact URL that was typed — mark it so the
+    // player plays this link and never substitutes a search result.
+    return { ...searchFirstLine(stdout), exact: true };
   }
   const sc = q.match(/^(?:sc:|soundcloud:)\s*(.+)/i);
   const target = sc ? sc[1] : q;
@@ -154,24 +156,35 @@ export async function resolveTrack(query) {
  * Backups, in order: the yt-dlp SoundCloud search, then ONE no-retry
  * YouTube search with a short cap. Throws a plain "no results" error.
  */
+// A mix/compilation is not the song (user order, Nov 26: searching
+// "paper trail" put on a mix). Search picks skip mix-titled results
+// unless the query itself asked for one; if every result is a mix,
+// the first still plays rather than nothing.
+const MIX_TITLE = /\b(mix|megamix|compilation|playlist|full album)\b/i;
+function pickFirst(list, query) {
+  if (!list?.length) return null;
+  if (MIX_TITLE.test(query)) return list[0];
+  return list.find((t) => !MIX_TITLE.test(t.title || '')) || list[0];
+}
+
 export async function resolveTextQuery(query) {
   const q = query.trim();
   const sc = q.match(/^(?:sc:|soundcloud:)\s*(.+)/i);
   const text = sc ? sc[1] : q;
   if (!sc) {
     const viaApi = await searchOnSoundCloudApi(text, '', { timeoutMs: 6_000 }).catch(() => []);
-    if (viaApi.length) return viaApi[0];
+    if (viaApi.length) return pickFirst(viaApi, text);
     // Not on SoundCloud: resolve the name against YouTube's own catalog
     // through an Invidious instance (YouTube search itself is walled
     // from this host; the instance is not). The returned track carries
     // the real video id, and the player streams it via Invidious too.
     const viaInv = await searchOnInvidious(text).catch(() => []);
-    if (viaInv.length) return viaInv[0];
+    if (viaInv.length) return pickFirst(viaInv, text);
   }
   const viaScSearch = await searchOnSoundCloud(text, '', { timeoutMs: 10_000, retry: false }).catch(() => []);
-  if (viaScSearch.length) return viaScSearch[0];
+  if (viaScSearch.length) return pickFirst(viaScSearch, text);
   const viaYt = await searchOnYouTube(text, '', { timeoutMs: 10_000, retry: false }).catch(() => []);
-  if (viaYt.length) return viaYt[0];
+  if (viaYt.length) return pickFirst(viaYt, text);
   throw new Error(`No results found for "${text}".`);
 }
 
@@ -230,19 +243,11 @@ export async function resolveYouTubeUrl(url) {
   const id = youtubeVideoId(url);
   if (!id) return resolveTrack(url);
   const viaInv = await getVideoOnInvidious(id).catch(() => null);
-  if (viaInv) return viaInv;
-  try {
-    const res = await fetch(
-      `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}&format=json`,
-      { signal: AbortSignal.timeout(5_000) },
-    );
-    if (res.ok) {
-      const data = await res.json();
-      if (data?.title) {
-        return await resolveTextQuery(`${data.title} ${data.author_name || ''}`.trim());
-      }
-    }
-  } catch { /* fall through to the yt-dlp last resort */ }
+  if (viaInv) return { ...viaInv, exact: true };
+  // A typed link plays THAT link (user order, Nov 26). The old shape
+  // fell back to a text search on the video's title, which queued a
+  // different upload — or a mix — instead of the link that was typed.
+  // yt-dlp metadata on the exact URL is the only fallback now.
   return resolveTrack(url);
 }
 
@@ -275,7 +280,7 @@ function directMediaTrack(q) {
   if (!DIRECT_MEDIA_EXTS.some((e) => path.endsWith(e))) return null;
   const base = decodeURIComponent(path.split('/').pop() || 'track');
   const title = base.replace(/\.(mp4|mp3|wav)$/i, '').replace(/[_-]+/g, ' ').trim() || 'track';
-  return { id: q, title, duration: 0, url: q };
+  return { id: q, title, duration: 0, url: q, exact: true };
 }
 
 export async function findOnYouTube(title, artist) {
@@ -295,15 +300,15 @@ export async function findOnYouTube(title, artist) {
   } catch { /* fall through to the side doors */ }
   // Door 2 — the same YouTube catalog through an Invidious instance.
   const viaInv = await searchOnInvidious(q).catch(() => []);
-  if (viaInv.length) return viaInv[0];
+  if (viaInv.length) return pickFirst(viaInv, q);
   // Door 3 — a SoundCloud track for the same song. The returned track
   // is SoundCloud-shaped, so the playback cascade plays it from its
   // own page first and its multi-candidate search after that — the
   // song still lands even when every YouTube door is walled.
   const viaApi = await searchOnSoundCloudApi(title, artist || '', { timeoutMs: 6_000 }).catch(() => []);
-  if (viaApi.length) return viaApi[0];
+  if (viaApi.length) return pickFirst(viaApi, q);
   const viaSc = await searchOnSoundCloud(title, artist || '', { timeoutMs: 10_000, retry: false }).catch(() => []);
-  if (viaSc.length) return viaSc[0];
+  if (viaSc.length) return pickFirst(viaSc, q);
   throw new Error(`No match for "${q}" on YouTube, Invidious or SoundCloud`);
 }
 
