@@ -435,7 +435,7 @@ function attachUploadHandler(client) {
         return;
       }
       if (!playable.length) {
-        await message.reply('🎧 I can only play **.mp3** and **.wav** uploads.').catch(() => {});
+        await message.reply('🎧 I can only play **.mp3**, **.wav** and **.mp4** uploads.').catch(() => {});
         return;
       }
       if (!member.voice?.channel) {
