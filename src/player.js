@@ -372,6 +372,10 @@ const PREFETCH_BUDGET_MS = 20_000;
 
 /** Coverage of the requested title's distinctive (non-artist) words, 0..1. */
 const VERSION_WORDS = new Set(['fast', 'sped', 'slowed', 'remix', 'cover', 'karaoke', 'instrumental', 'nightcore', 'reverb', 'jersey', 'freestyle']);
+// A mix/compilation is not the song (user order, Nov 26: "paper trail"
+// put on a mix). Penalized harder than versions so the plain track
+// always outranks one unless the request itself asked for a mix.
+const MIX_WORDS = new Set(['mix', 'megamix', 'compilation', 'playlist']);
 
 function titleScore(requested, candidate) {
   const reqAll = normTokens(requested.title);
@@ -393,6 +397,7 @@ function titleScore(requested, candidate) {
   const candTitle = normTokens(candidate.title);
   for (const w of candTitle) {
     if (VERSION_WORDS.has(w) && !reqAll.has(w)) score -= 0.15;
+    if (MIX_WORDS.has(w) && !reqAll.has(w)) score -= 0.3;
   }
   return Math.max(0, score);
 }
@@ -620,6 +625,9 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
   // merged and deduped. Best-effort: any failure just leaves the lanes
   // with the track's own video id.
   const uploadsPromise = (async () => {
+    // A typed link plays THAT link (user order, Nov 26): no other
+    // uploads are discovered for exact tracks.
+    if (track.exact) return [];
     try {
       const [ytRes, invRes] = await Promise.allSettled([
         searchOnYouTube(searchTitle, artist, {
@@ -660,6 +668,10 @@ export async function resolvePlayable(track, { budgetMs = RESOLVE_BUDGET_MS, pri
         return ok;
       } catch (err) { noteFail('soundcloud', err); }
     }
+    // Exact (typed-link) tracks never fall into the candidate pool:
+    // a typed YouTube link gets no SoundCloud substitute, and a typed
+    // SoundCloud link plays from its own page or not at all.
+    if (track.exact) return null;
     const byId = new Map();
     const addAll = (list) => {
       for (const c of list || []) {
